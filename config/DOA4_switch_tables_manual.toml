@@ -1,0 +1,29 @@
+# Hand-verified jump tables merged into DOA4_switch_tables.toml by tools/boundaries.py.
+# Entries here replace any XenonAnalyse entry with the same base.
+
+# Unguarded 16-bit offset table in sub_8275E2F8 (.pdata function 0x8275E2F8-0x8275E7B0), indexed by argument r5.
+# Table at 0x821FB390 in .rdata: 18 halfword offsets from 0x8275E340, followed by ASCII text.
+[[switch]]
+base = 0x8275E318
+r = 5
+default = 0x0
+labels = [
+    0x8275E340,
+    0x8275E360,
+    0x8275E38C,
+    0x8275E3A4,
+    0x8275E40C,
+    0x8275E428,
+    0x8275E468,
+    0x8275E50C,
+    0x8275E588,
+    0x8275E5D8,
+    0x8275E638,
+    0x8275E66C,
+    0x8275E6B0,
+    0x8275E6E0,
+    0x8275E70C,
+    0x8275E738,
+    0x8275E76C,
+    0x8275E4FC,
+]
