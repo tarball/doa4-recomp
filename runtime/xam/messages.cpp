@@ -2,6 +2,7 @@
 // Known messages are answered as the offline dashboard would (values per Xenia); others are logged.
 #include "guest_abi.h"
 #include "log.h"
+#include "netplay/frame.h"
 #include "xam/achievements.h"
 #include "xam/xam.h"
 
@@ -39,7 +40,18 @@ namespace
             return xam::kErrorSuccess;
         }
 
-        LOG_WARN("XMsg: unhandled message 0x%08X to app 0x%02X (buffer 0x%08X, %u bytes)", message, app, buffer, bufferLength);
+        // A small buffer's words too. (0x0007001A to 0xFA, Xenia's XMPSetPlaybackController, has three: DOA4 sends 2, 0, 1 as
+        // its boot movie starts and 2, 4, 0 as it ends, and nothing waits for the answer.)
+        char words[40] = "";
+        if (buffer && bufferLength && bufferLength <= 16 && bufferLength % 4 == 0 && guest::IsAllocated(buffer) &&
+            guest::IsAllocated(buffer + bufferLength - 1))
+        {
+            char* end = words;
+            for (uint32_t i = 0; i < bufferLength; i += 4)
+                end += snprintf(end, size_t(words + sizeof(words) - end), "%s%08X", i ? " " : ": ", guest::LoadU32(buffer + i));
+        }
+        LOG_WARN("XMsg: unhandled message 0x%08X to app 0x%02X (buffer 0x%08X, %u bytes%s) at frame %llu", message, app, buffer, bufferLength,
+            words, (unsigned long long)netplay::Frame());
         return kNotFound;
     }
 

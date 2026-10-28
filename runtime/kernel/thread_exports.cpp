@@ -5,6 +5,7 @@
 #include "kernel/threads.h"
 #include "log.h"
 
+#include <algorithm>
 #include <chrono>
 #include <thread>
 
@@ -133,10 +134,18 @@ namespace
         {
             GuestThread* thread = CurrentThread();
             if (thread)
+            {
                 thread->waits++;
+                thread->waitObject.store(0, std::memory_order_relaxed);
+                thread->waitCount.store(uint32_t(std::min<int64_t>(-ticks / 10000, 0xFFFFFFFF)), std::memory_order_relaxed); // ms
+                thread->waitKind.store(GuestThread::WaitKind::kDelay, std::memory_order_release);
+            }
             std::this_thread::sleep_for(std::chrono::nanoseconds(-ticks * 100));
             if (thread)
+            {
+                thread->waitKind.store(GuestThread::WaitKind::kNone, std::memory_order_release);
                 thread->waits--;
+            }
         }
         return status::kSuccess;
     }

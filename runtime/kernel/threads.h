@@ -60,6 +60,8 @@ namespace kernel
         // Return the previous suspend count.
         uint32_t Resume();
         uint32_t Suspend();
+        // The suspend count now (diagnostics).
+        uint32_t SuspendCount() const;
 
         // Blocks the calling host thread until this thread has finished.
         void Join();
@@ -74,6 +76,19 @@ namespace kernel
         // Blocking waits the thread is in (kernel waits and delays): netplay checks that the game's workers are idle at
         // a frame boundary.
         std::atomic<uint32_t> waits{ 0 };
+        // What it waits for now, for the thread dumps (DumpGuestThreads: written by the thread, read racily): the kind of
+        // wait, and the first object's guest address and the objects' count (a critical section's address).
+        enum class WaitKind : uint8_t
+        {
+            kNone,
+            kAny,             // one of the objects (a single object's wait too)
+            kAll,             // all of them
+            kCriticalSection, // its embedded event, the section held by another thread
+            kDelay,           // a sleep
+            kSuspended,       // suspended by itself, until another thread resumes it
+        };
+        std::atomic<WaitKind> waitKind{ WaitKind::kNone };
+        std::atomic<uint32_t> waitObject{ 0 }, waitCount{ 0 };
 
         // Per-thread kernel state used by exports.
         std::array<uint32_t, kTlsSlotCount> tls{};
@@ -98,9 +113,10 @@ namespace kernel
         void* m_hostThread = nullptr;
 
         std::mutex m_lock;
-        std::condition_variable m_resumed;
-        uint32_t m_suspendCount = 0;
+        std::condition_variable m_resumed; // the suspend count back at 0: for a thread not started, or suspended by itself
+        std::atomic<uint32_t> m_suspendCount{ 0 }; // changed under m_lock; read without it by SuspendCount
         bool m_started = false;
+        bool m_hostSuspended = false;      // the host thread stopped by another thread's Suspend (SuspendThread)
         std::shared_ptr<GuestThread> m_self; // keeps the object alive while the host thread runs
     };
 

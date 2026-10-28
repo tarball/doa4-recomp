@@ -210,9 +210,18 @@ namespace
 
         if (AtomicAdd(&section->lockCount, 1) != 0)
         {
-            // Contended: wait for the owner's release to signal the embedded event.
+            // Contended: wait for the owner's release to signal the embedded event (the thread dumps name the section).
             const uint32_t headers[] = { guest::ToGuest(&section->header) };
+            GuestThread* thread = CurrentThread();
+            if (thread)
+            {
+                thread->waitObject.store(headers[0], std::memory_order_relaxed);
+                thread->waitCount.store(1, std::memory_order_relaxed);
+                thread->waitKind.store(GuestThread::WaitKind::kCriticalSection, std::memory_order_release);
+            }
             WaitForHeaders(headers, false, nullptr);
+            if (thread)
+                thread->waitKind.store(GuestThread::WaitKind::kNone, std::memory_order_release);
         }
         section->owningThread = self;
         section->recursionCount = 1;

@@ -388,7 +388,8 @@ int main(int argc, char** argv)
             p = *end ? end + 1 : end;
         }
     }
-    // THREAD_DUMP=<seconds> prints every guest thread's call chain once, after that long.
+    // THREAD_DUMP=<seconds> prints every guest thread's call chain and wait, the command processor's last packets and every
+    // thread's host call stack once, after that long.
     const char* threadDump = std::getenv(GAME_PREFIX "_THREAD_DUMP");
     const int threadDumpSeconds = threadDump ? std::atoi(threadDump) : 0;
     profile::Start([] { return uint64_t(gpu::GetStatistics().swaps.load()); });
@@ -405,21 +406,45 @@ int main(int argc, char** argv)
             {
                 kernel::DumpGuestThreads();
                 gpu::DumpRecentPackets(60);
+                profile::DumpHostStacks();
             }
             const uint64_t swaps = stats.swaps;
             LOG_INFO("GPU: %llu frames (%.1f fps), %llu draws, %llu packets, %llu vblanks", (unsigned long long)swaps,
                 (swaps - lastSwaps) / 5.0, (unsigned long long)stats.draws.load(), (unsigned long long)stats.packets.load(),
                 (unsigned long long)stats.vblanks.load());
             // A game that stopped making frames once it had (hung, or a netplay session waiting for the other machine; loading
-            // screens are frames too): where its threads and the command processor are, once.
+            // screens are frames too): where its threads and the command processor are, once. And outside a session, whose
+            // own status says when it waits for the other machine, the window's title says so after 10 s, until frames come.
             static bool hangDumped = false;
-            if (swaps && swaps == lastSwaps && !hangDumped)
+            static int stoppedSeconds = 0;
+            static bool titleSaysStopped = false;
+            if (swaps && swaps == lastSwaps)
             {
-                hangDumped = true;
-                LOG_WARN("GPU: no frame in 5 s (a hang, or a session waiting): the guest threads' call chains and the command processor's last "
-                         "packets follow");
-                kernel::DumpGuestThreads();
-                gpu::DumpRecentPackets(60);
+                stoppedSeconds += 5;
+                if (!hangDumped)
+                {
+                    hangDumped = true;
+                    LOG_WARN("GPU: no frame in 5 s (a hang, or a session waiting): the guest threads' call chains and waits, the command "
+                             "processor's last packets and every thread's host call stack follow");
+                    kernel::DumpGuestThreads();
+                    gpu::DumpRecentPackets(60);
+                    profile::DumpHostStacks();
+                }
+                if (stoppedSeconds >= 10 && !netplay::session::Configured())
+                {
+                    titleSaysStopped = true;
+                    ui::SetTitleStatus("not responding: no new frame for " + std::to_string(stoppedSeconds) + " s (" GAME_EXECUTABLE
+                                       ".log says what each thread waits for)");
+                }
+            }
+            else
+            {
+                if (stoppedSeconds >= 10)
+                    LOG_INFO("GPU: frames again, after %d s without one", stoppedSeconds);
+                if (titleSaysStopped)
+                    ui::SetTitleStatus("");
+                stoppedSeconds = 0;
+                titleSaysStopped = false;
             }
             for (uint32_t address : watches)
                 LOG_INFO("  [%08X] = %08X", address, guest::LoadU32(address));

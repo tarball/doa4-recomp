@@ -19,6 +19,7 @@
 #include "xam/achievements.h"
 #include "xam/spa.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
@@ -633,6 +634,83 @@ static void test_pulse_and_spinlock()
     CHECK(call(__imp__KeTryToAcquireSpinLockAtRaisedIrql, lock) == 0, "try-acquire fails while held");
     call(__imp__KfReleaseSpinLock, lock, irql);
     CHECK(guest::LoadU32(lock) == 0 && call(__imp__KeTryToAcquireSpinLockAtRaisedIrql, lock) == 1, "released and re-acquirable");
+}
+
+// A thread that suspends itself, as CRI's server thread does at the end of each pass (NtSuspendThread on itself), and one
+// that resumes it, as CRI's vsync thread does at each vsync: a resume that comes as the thread suspends itself mustn't be
+// lost. The suspending thread counts its rounds; the test resumes it as fast as it can until it has done them all.
+PPC_EXTERN_FUNC(__imp__NtSuspendThread); // (not in the generated declarations of a game that doesn't import it)
+
+static std::atomic<uint32_t> g_selfSuspensions{ 0 };
+static std::atomic<bool> g_spinnerStop{ false };
+static std::atomic<uint64_t> g_spins{ 0 };
+static constexpr uint32_t kSelfSuspensionRounds = 20000;
+
+static void ThreadSuspendsItself(PPCContext& ctx, uint8_t* base)
+{
+    for (uint32_t round = 0; round < kSelfSuspensionRounds; round++)
+    {
+        ctx.r3.u64 = kernel::kCurrentThreadHandle;
+        ctx.r4.u64 = 0;
+        __imp__NtSuspendThread(ctx, base);
+        g_selfSuspensions++;
+    }
+}
+
+static void ThreadSpins(PPCContext&, uint8_t*)
+{
+    while (!g_spinnerStop)
+        g_spins++;
+}
+
+static void test_suspension()
+{
+    Call call;
+    const uint32_t handlePtr = Scratch() + 0x860, countPtr = Scratch() + 0x864;
+    const uint32_t body = RegisterGuestFunction(6, ThreadSuspendsItself);
+    CHECK(call(__imp__ExCreateThread, handlePtr, 0, 0, 0, body, 0, 0) == status::kSuccess, "create the self-suspending thread");
+    uint32_t handle = guest::LoadU32(handlePtr);
+    // A resume lost as the thread suspends itself would leave it suspended for good, which the 10 s ends.
+    uint32_t mostPrevious = 0;
+    for (const uint64_t deadline = GetTickCount64() + 10000; g_selfSuspensions < kSelfSuspensionRounds && GetTickCount64() < deadline;)
+    {
+        call(__imp__NtResumeThread, handle, countPtr);
+        mostPrevious = std::max(mostPrevious, guest::LoadU32(countPtr));
+    }
+    const uint32_t rounds = g_selfSuspensions;
+    CHECK(rounds == kSelfSuspensionRounds, "the thread got through %u of its %u self-suspensions before a resume was lost", rounds,
+        kSelfSuspensionRounds);
+    CHECK(mostPrevious <= 1, "a resume found the suspend count at %u (at most 1: a resume of a running thread does nothing)", mostPrevious);
+    if (rounds == kSelfSuspensionRounds)
+        CHECK(WaitForThread(call, handle) == status::kSuccess, "the thread finished");
+    call(__imp__NtClose, handle);
+
+    // Another thread suspended and resumed: it stops, then goes on.
+    const uint32_t spinner = RegisterGuestFunction(7, ThreadSpins);
+    CHECK(call(__imp__ExCreateThread, handlePtr, 0, 0, 0, spinner, 0, 0) == status::kSuccess, "create the spinning thread");
+    handle = guest::LoadU32(handlePtr);
+    for (const uint64_t started = GetTickCount64() + 5000; g_spins == 0 && GetTickCount64() < started;)
+        Sleep(1);
+    CHECK(g_spins != 0, "the spinning thread runs");
+    CHECK(call(__imp__NtSuspendThread, handle, countPtr) == status::kSuccess && guest::LoadU32(countPtr) == 0, "suspend (previous count 0)");
+    CHECK(call(__imp__NtSuspendThread, handle, countPtr) == status::kSuccess && guest::LoadU32(countPtr) == 1, "suspend again (previous count 1)");
+    Sleep(20);
+    const uint64_t spinsSuspended = g_spins;
+    Sleep(50);
+    CHECK(g_spins == spinsSuspended, "the suspended thread stopped (%llu spins, then %llu)", (unsigned long long)spinsSuspended,
+        (unsigned long long)g_spins.load());
+    CHECK(call(__imp__NtResumeThread, handle, countPtr) == status::kSuccess && guest::LoadU32(countPtr) == 2, "resume (previous count 2)");
+    Sleep(50);
+    CHECK(g_spins == spinsSuspended, "still suspended at count 1");
+    CHECK(call(__imp__NtResumeThread, handle, countPtr) == status::kSuccess && guest::LoadU32(countPtr) == 1, "resume (previous count 1)");
+    const uint64_t deadline = GetTickCount64() + 5000;
+    while (g_spins == spinsSuspended && GetTickCount64() < deadline)
+        Sleep(1);
+    CHECK(g_spins != spinsSuspended, "the resumed thread runs again");
+    CHECK(call(__imp__NtResumeThread, handle, countPtr) == status::kSuccess && guest::LoadU32(countPtr) == 0, "resume of a running thread (previous count 0)");
+    g_spinnerStop = true;
+    CHECK(WaitForThread(call, handle) == status::kSuccess, "the spinning thread finished");
+    call(__imp__NtClose, handle);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1252,6 +1330,7 @@ int main()
     RUN(test_threads);
     RUN(test_critical_section_contention);
     RUN(test_pulse_and_spinlock);
+    RUN(test_suspension);
     RUN(test_shader_binaries);
     RUN(test_xma_decoding);
     RUN(test_journal_divergence);

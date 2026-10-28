@@ -237,14 +237,34 @@ namespace kernel
             deadline = Clock::now() + std::chrono::nanoseconds(relative * 100);
         }
 
-        // The thread counts as waiting until it returns.
+        // The thread counts as waiting until it returns, and says what for (unless a critical section's wait already has).
         GuestThread* thread = CurrentThread();
         struct Waiting
         {
             GuestThread* thread;
-            Waiting(GuestThread* t) : thread(t) { if (thread) thread->waits++; }
-            ~Waiting() { if (thread) thread->waits--; }
-        } waiting(thread);
+            bool described = false;
+            Waiting(GuestThread* t, std::span<const uint32_t> headers, bool waitAll) : thread(t)
+            {
+                if (!thread)
+                    return;
+                thread->waits++;
+                if (thread->waitKind.load(std::memory_order_relaxed) == GuestThread::WaitKind::kNone)
+                {
+                    described = true;
+                    thread->waitObject.store(headers.empty() ? 0 : headers[0], std::memory_order_relaxed);
+                    thread->waitCount.store(uint32_t(headers.size()), std::memory_order_relaxed);
+                    thread->waitKind.store(waitAll ? GuestThread::WaitKind::kAll : GuestThread::WaitKind::kAny, std::memory_order_release);
+                }
+            }
+            ~Waiting()
+            {
+                if (!thread)
+                    return;
+                if (described)
+                    thread->waitKind.store(GuestThread::WaitKind::kNone, std::memory_order_release);
+                thread->waits--;
+            }
+        } waiting(thread, headers, waitAll);
         Waiter waiter{ headers, waitAll };
         auto& waiters = Waiters();
         waiters.push_back(&waiter);

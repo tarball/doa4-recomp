@@ -1,6 +1,7 @@
 #include "kernel/threads.h"
 
 #include "guest_abi.h"
+#include "guest_memory.h"
 #include "kernel/module.h"
 #include "kernel/status.h"
 #include "log.h"
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <string>
 #include <utility>
 
 #include <windows.h>
@@ -121,19 +123,128 @@ namespace kernel
             callback(*thread);
     }
 
+    namespace
+    {
+        // A guest thread by its KTHREAD, for the thread dumps: "thread <id>", or the address. (ThreadRegistryLock held: found
+        // in the registry, not the object map, whose reference could outlast every other and destroy the thread here, its
+        // destructor taking that lock.)
+        std::string ThreadName(uint32_t kthread)
+        {
+            char text[32];
+            const std::vector<GuestThread*>& threads = ThreadRegistry();
+            if (const auto it = std::find_if(threads.begin(), threads.end(), [kthread](const GuestThread* t) { return t->KThread() == kthread; });
+                it != threads.end())
+                snprintf(text, sizeof(text), "thread %u", (*it)->ThreadId());
+            else if (kthread & 0x80000000u && kthread < 0x90000000u)
+                snprintf(text, sizeof(text), "host thread %u", kthread & 0x7FFFFFFFu); // RtlEnterCriticalSection's OwnerId
+            else
+                snprintf(text, sizeof(text), "KTHREAD 0x%08X", kthread);
+            return text;
+        }
+
+        // A dispatcher object for the thread dumps: its kind, address and state.
+        std::string DescribeObject(uint32_t address)
+        {
+            char text[96];
+            if (!address || !guest::IsAllocated(address))
+            {
+                snprintf(text, sizeof(text), "object 0x%08X", address);
+                return text;
+            }
+            const auto* header = guest::Translate<DispatcherHeader>(address);
+            const int32_t state = header->signalState;
+            switch (DispatcherType(header->type))
+            {
+            case DispatcherType::NotificationEvent:
+            case DispatcherType::SynchronizationEvent:
+                snprintf(text, sizeof(text), "%s event 0x%08X (%s)", header->type ? "synchronization" : "notification", address,
+                    state ? "set" : "not set");
+                break;
+            case DispatcherType::Semaphore:
+                snprintf(text, sizeof(text), "semaphore 0x%08X (count %d)", address, state);
+                break;
+            case DispatcherType::Thread:
+                snprintf(text, sizeof(text), "the end of %s", ThreadName(address).c_str());
+                break;
+            case DispatcherType::NotificationTimer:
+            case DispatcherType::SynchronizationTimer:
+                snprintf(text, sizeof(text), "timer 0x%08X (%s)", address, state ? "signaled" : "not signaled");
+                break;
+            default:
+                snprintf(text, sizeof(text), "object 0x%08X (type %u, state %d)", address, header->type, state);
+                break;
+            }
+            return text;
+        }
+
+        // What a guest thread waits for (GuestThread::waitKind), for the thread dumps.
+        std::string DescribeWait(const GuestThread& thread)
+        {
+            const GuestThread::WaitKind kind = thread.waitKind.load(std::memory_order_acquire);
+            const uint32_t object = thread.waitObject.load(std::memory_order_relaxed), count = thread.waitCount.load(std::memory_order_relaxed);
+            char text[160];
+            switch (kind)
+            {
+            case GuestThread::WaitKind::kAny:
+            case GuestThread::WaitKind::kAll:
+                if (count > 1)
+                    snprintf(text, sizeof(text), "waits for %s %u objects, the first %s", kind == GuestThread::WaitKind::kAll ? "all of" : "one of",
+                        count, DescribeObject(object).c_str());
+                else
+                    snprintf(text, sizeof(text), "waits for %s", DescribeObject(object).c_str());
+                return text;
+            case GuestThread::WaitKind::kCriticalSection:
+            {
+                // RTL_CRITICAL_SECTION: its event's header, the lock count (-1 free), the recursion count, the owner's KTHREAD.
+                const uint32_t owner = guest::IsAllocated(object) ? guest::LoadU32(object + 0x18) : 0;
+                const int32_t lockCount = guest::IsAllocated(object) ? int32_t(guest::LoadU32(object + 0x10)) : 0;
+                snprintf(text, sizeof(text), "waits for critical section 0x%08X, held by %s (lock count %d)", object,
+                    owner ? ThreadName(owner).c_str() : "nobody", lockCount);
+                return text;
+            }
+            case GuestThread::WaitKind::kDelay:
+                snprintf(text, sizeof(text), "sleeps (%u ms)", count);
+                return text;
+            case GuestThread::WaitKind::kSuspended:
+                return "suspended by itself";
+            default:
+                return thread.waits.load(std::memory_order_relaxed) ? "waiting" : "not waiting";
+            }
+        }
+    }
+
     void DumpGuestThreads()
     {
+        // The host thread's suspend count (NtQueryInformationThread's ThreadSuspendCount, Windows 8.1 on) beside the
+        // guest's: the two must agree, or the thread can't be resumed as the guest asks.
+        using QueryThreadFunction = LONG(NTAPI*)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+        static const auto queryThread =
+            reinterpret_cast<QueryThreadFunction>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        constexpr ULONG kThreadSuspendCount = 35;
         std::lock_guard lock(ThreadRegistryLock());
         for (GuestThread* thread : ThreadRegistry())
         {
             const PPCContext* ctx = thread->Context();
             if (!ctx)
                 continue;
-            fprintf(stderr, "[threads] thread %u (start 0x%08X): lr=%08X r1=%08X r3=%08X r4=%08X\n", thread->ThreadId(),
-                guest::LoadU32(thread->KThread() + kKThreadStartAddress), uint32_t(ctx->lr), ctx->r1.u32, ctx->r3.u32, ctx->r4.u32);
+            ULONG hostSuspends = 0;
+            const bool hostKnown = queryThread && thread->NativeHandle() &&
+                queryThread(thread->NativeHandle(), kThreadSuspendCount, &hostSuspends, sizeof(hostSuspends), nullptr) >= 0;
+            char host[16] = "?";
+            if (hostKnown)
+                snprintf(host, sizeof(host), "%lu", hostSuspends);
+            fprintf(stderr, "[threads] thread %u (start 0x%08X): lr=%08X r1=%08X r3=%08X r4=%08X; suspend count %u (host %s); %s\n",
+                thread->ThreadId(), guest::LoadU32(thread->KThread() + kKThreadStartAddress), uint32_t(ctx->lr), ctx->r1.u32, ctx->r3.u32,
+                ctx->r4.u32, thread->SuspendCount(), host, DescribeWait(*thread).c_str());
             guest::PrintBacktrace(ctx->r1.u32, 8);
         }
         fflush(stderr);
+    }
+
+    uint32_t GuestThread::SuspendCount() const
+    {
+        // Without the lock: the dumps run when threads may be stuck, one holding it perhaps.
+        return m_suspendCount.load(std::memory_order_relaxed);
     }
 
         std::shared_ptr<GuestThread> GuestThread::Create(const Params& params)
@@ -313,37 +424,52 @@ namespace kernel
         std::shared_ptr<GuestThread> self = std::move(m_self);
     }
 
+    // The suspend count, as the 360's kernel keeps it: the thread runs only at 0; a resume at 0 does nothing (the 360
+    // doesn't bank it). Its changes and what they do happen under m_lock, so a suspend and a resume that come together are
+    // taken in some order, each in full.
     uint32_t GuestThread::Resume()
     {
         std::lock_guard lock(m_lock);
         const uint32_t previous = m_suspendCount;
-        if (m_suspendCount > 0)
+        if (m_suspendCount > 0 && --m_suspendCount == 0)
         {
-            m_suspendCount--;
-            if (m_suspendCount == 0)
+            // Stopped by another thread: the host thread goes on. Suspended by itself, or not started: it wakes from its
+            // wait in Suspend or Run.
+            if (m_hostSuspended)
             {
-                if (m_started)
-                    ResumeThread(m_hostThread);
-                else
-                    m_resumed.notify_all();
+                ResumeThread(m_hostThread);
+                m_hostSuspended = false;
             }
+            m_resumed.notify_all();
         }
         return previous;
     }
 
     uint32_t GuestThread::Suspend()
     {
-        uint32_t previous;
-        bool suspendHost;
+        std::unique_lock lock(m_lock);
+        const uint32_t previous = m_suspendCount++;
+        if (t_currentThread == this)
         {
-            std::lock_guard lock(m_lock);
-            previous = m_suspendCount++;
-            // A running thread is stopped by the host; one that hasn't started simply stays parked.
-            suspendHost = m_started && previous == 0;
+            // The thread suspends itself, as CRI's server thread does at the end of each pass, its vsync thread resuming it
+            // each vsync: it waits until resumed, the count checked and the wait begun under the lock Resume takes. (Its
+            // host thread used to suspend itself after the lock was released, and a resume between the two found the
+            // count at 1 and resumed a host thread that wasn't suspended yet: the count back at 0 with the thread
+            // stopped for good, which no later resume would start, since none found it suspended. CRI's server stopped
+            // so, which froze the boot's movie: ANALYSIS.md, Phase 6, The two rare freezes.)
+            waits++;
+            waitKind.store(WaitKind::kSuspended, std::memory_order_release);
+            m_resumed.wait(lock, [this] { return m_suspendCount == 0; });
+            waitKind.store(WaitKind::kNone, std::memory_order_release);
+            waits--;
         }
-        // Outside the lock: a thread may suspend itself (CRI does), and Resume must still get the lock.
-        if (suspendHost)
+        else if (previous == 0 && m_started)
+        {
+            // Another thread, running: stopped on the host, under the lock, so that Resume finds it so. One that hasn't
+            // started stays in its wait in Run.
             SuspendThread(m_hostThread);
+            m_hostSuspended = true;
+        }
         return previous;
     }
 

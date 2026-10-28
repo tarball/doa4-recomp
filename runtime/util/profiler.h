@@ -103,4 +103,13 @@ namespace profile
         kCount
     };
     void Count(Counter counter, uint64_t amount = 1);
+
+    // Prints every thread's host call stack (but the caller's), up to `maxDepth` frames each, to stderr: for a hang, where
+    // each thread waits, the runtime's waits too, which the guest threads' call chains don't show. Each stack is walked
+    // with its thread suspended a moment, one thread at a time; functions are named from the PDBs in the executable's
+    // folder (none in a release: then the module and the offset), the game's code by its guest address (sub_XXXXXXXX).
+    // Works whether PROFILE is set or not.
+    void DumpHostStacks(uint32_t maxDepth = 24);
+    // The same on the calling thread, which must handle a bad frame's fault itself (crash::SuppressReportsOnThisThread).
+    void DumpHostStacksHere(uint32_t maxDepth = 24);
 }

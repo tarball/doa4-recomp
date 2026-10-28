@@ -431,11 +431,54 @@ namespace profile
                 return m_names.emplace(start, std::move(name)).first->second;
             }
 
+            // A code address in a call stack: its function and the offset into it (generated functions by the function
+            // table, as sub_XXXXXXXX), or the module and the offset into it.
+            std::string Describe(const ModuleList& modules, uintptr_t address)
+            {
+                const Module* module = FindModule(modules, address);
+                std::string text = module ? module->name : "";
+                if (const uint32_t guest = crash::GuestFunctionAt(address))
+                {
+                    Appendf(text, "!sub_%08X", guest);
+                    return text;
+                }
+                alignas(SYMBOL_INFO) char buffer[sizeof(SYMBOL_INFO) + 512];
+                auto* symbol = reinterpret_cast<SYMBOL_INFO*>(buffer);
+                symbol->SizeOfStruct = sizeof(SYMBOL_INFO);
+                symbol->MaxNameLen = 512;
+                DWORD64 displacement = 0;
+                const bool named = module && m_ready && SymFromAddr(GetCurrentProcess(), address, &displacement, symbol);
+                // Without a PDB (the runtime's in a release, Windows' own DLLs) DbgHelp names the nearest export, which may
+                // be another function: then the offset into the module, and the export only beside it, if it's near.
+                IMAGEHLP_MODULE64 info{};
+                info.SizeOfStruct = sizeof(info);
+                const bool pdb = named && SymGetModuleInfo64(GetCurrentProcess(), address, &info) && (info.SymType == SymPdb || info.SymType == SymDia);
+                if (pdb)
+                    Appendf(text, "!%s+0x%llX", symbol->Name, (unsigned long long)displacement);
+                else if (module)
+                {
+                    Appendf(text, "+0x%llX", (unsigned long long)(address - module->base));
+                    if (named && displacement < 0x1000)
+                        Appendf(text, " (%s+0x%llX)", symbol->Name, (unsigned long long)displacement);
+                }
+                else
+                    Appendf(text, "%016llX", (unsigned long long)address);
+                return text;
+            }
+
         private:
             bool m_ready = false;
             std::unordered_map<uintptr_t, uintptr_t> m_leafStarts;
             std::unordered_map<uintptr_t, std::string> m_names;
         };
+
+        // DbgHelp isn't thread-safe: one symbolizer for the profiler's reports and the host stacks' dumps, one at a time.
+        std::mutex g_symbolLock;
+        Symbolizer& SharedSymbols() // (g_symbolLock held)
+        {
+            static Symbolizer symbols;
+            return symbols;
+        }
 
         double Percentile(std::vector<double>& values, double fraction)
         {
@@ -633,8 +676,8 @@ namespace profile
                 }
                 if (samples.empty() || !modules)
                     return;
-                if (!m_symbols)
-                    m_symbols = std::make_unique<Symbolizer>();
+                std::lock_guard symbolLock(g_symbolLock);
+                Symbolizer& symbols = SharedSymbols();
 
                 // Per thread: samples by leaf function (self) and by every function on the stack (inclusive),
                 // and the leaf functions' callers.
@@ -659,7 +702,7 @@ namespace profile
                     {
                         // Return addresses point after the call; look up the call itself.
                         const uintptr_t address = uintptr_t(frames[sample.first + i]) - (i ? 1 : 0);
-                        stack.push_back(m_symbols->FunctionStart(*modules, address));
+                        stack.push_back(symbols.FunctionStart(*modules, address));
                     }
                     counts.self[stack[0]]++;
                     if (stack.size() > 1)
@@ -677,7 +720,7 @@ namespace profile
                         for (size_t i = stack.size(); i-- > 0;)
                         {
                             line += ';';
-                            line += m_symbols->Name(*modules, stack[i]);
+                            line += symbols.Name(*modules, stack[i]);
                         }
                         foldedStacks[line]++;
                     }
@@ -700,7 +743,7 @@ namespace profile
                     Appendf(out, "[profile]   self:\n");
                     for (size_t i = 0; i < rows.size() && i < 30; i++)
                     {
-                        Appendf(out, "[profile]     %5.1f%%  %s", 100.0 * rows[i].second / counts.total, m_symbols->Name(*modules, rows[i].first).c_str());
+                        Appendf(out, "[profile]     %5.1f%%  %s", 100.0 * rows[i].second / counts.total, symbols.Name(*modules, rows[i].first).c_str());
                         // The top callers of the hottest functions.
                         if (i < 12)
                         {
@@ -708,7 +751,7 @@ namespace profile
                             std::vector<std::pair<uintptr_t, uint32_t>> callerRows(callers.begin(), callers.end());
                             std::sort(callerRows.begin(), callerRows.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
                             for (size_t c = 0; c < callerRows.size() && c < 3; c++)
-                                Appendf(out, "%s %s %.0f%%", c ? "," : "  <-", m_symbols->Name(*modules, callerRows[c].first).c_str(),
+                                Appendf(out, "%s %s %.0f%%", c ? "," : "  <-", symbols.Name(*modules, callerRows[c].first).c_str(),
                                     100.0 * callerRows[c].second / rows[i].second);
                         }
                         out += "\n";
@@ -718,7 +761,7 @@ namespace profile
                     Appendf(out, "[profile]   inclusive:\n");
                     for (size_t i = 0, shown = 0; i < rows.size() && shown < 40; i++)
                     {
-                        Appendf(out, "[profile]     %5.1f%%  %s\n", 100.0 * rows[i].second / counts.total, m_symbols->Name(*modules, rows[i].first).c_str());
+                        Appendf(out, "[profile]     %5.1f%%  %s\n", 100.0 * rows[i].second / counts.total, symbols.Name(*modules, rows[i].first).c_str());
                         shown++;
                     }
                 }
@@ -741,7 +784,6 @@ namespace profile
             int m_seconds;
             int m_sampleHertz;
             double m_ticksPerMs = 1.0;
-            std::unique_ptr<Symbolizer> m_symbols;
         };
     }
 
@@ -749,6 +791,97 @@ namespace profile
     {
         static const bool enabled = std::getenv(GAME_PREFIX "_PROFILE") != nullptr;
         return enabled;
+    }
+
+    void DumpHostStacks(uint32_t maxDepth)
+    {
+        // On a thread of its own, which handles the faults of a bad frame's walk itself (no crash report for them).
+        std::thread([maxDepth] {
+            NameThread("Host stacks' dump");
+            crash::SuppressReportsOnThisThread();
+            DumpHostStacksHere(maxDepth);
+        }).join();
+    }
+
+    void DumpHostStacksHere(uint32_t maxDepth)
+    {
+        static const auto queryThread =
+            reinterpret_cast<NtQueryInformationThreadFunction>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+        maxDepth = std::min<uint32_t>(std::max<uint32_t>(maxDepth, 1), kMaxDepth);
+        // The threads and their names first: nothing is allocated while a thread is suspended (it may hold the heap's lock).
+        struct Thread
+        {
+            DWORD tid = 0;
+            HANDLE handle = nullptr;
+            const NT_TIB* tib = nullptr;
+            std::string name;
+            std::vector<uint64_t> frames;
+        };
+        std::vector<Thread> threads;
+        const DWORD process = GetCurrentProcessId(), self = GetCurrentThreadId();
+        if (const HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0); snapshot != INVALID_HANDLE_VALUE)
+        {
+            THREADENTRY32 entry{ sizeof(entry) };
+            for (BOOL more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry))
+            {
+                if (entry.th32OwnerProcessID != process || entry.th32ThreadID == self)
+                    continue;
+                const HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, entry.th32ThreadID);
+                if (!handle)
+                    continue;
+                ThreadBasicInformation information{};
+                if (!queryThread || queryThread(handle, 0, &information, sizeof(information), nullptr) < 0 || !information.tebBaseAddress)
+                {
+                    CloseHandle(handle);
+                    continue;
+                }
+                Thread& thread = threads.emplace_back();
+                thread.tid = entry.th32ThreadID;
+                thread.handle = handle;
+                thread.tib = static_cast<const NT_TIB*>(information.tebBaseAddress);
+                thread.frames.resize(kMaxDepth);
+                PWSTR description = nullptr;
+                if (SUCCEEDED(GetThreadDescription(handle, &description)) && description)
+                {
+                    thread.name = Utf8(description);
+                    LocalFree(description);
+                }
+            }
+            CloseHandle(snapshot);
+        }
+        const std::shared_ptr<const ModuleList> modules = LoadModules();
+        // Each stack walked with its thread suspended, one thread at a time (Unwind neither allocates nor locks).
+        for (Thread& thread : threads)
+        {
+            int depth = 0;
+            if (SuspendThread(thread.handle) != DWORD(-1))
+            {
+                CONTEXT context{};
+                context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (GetThreadContext(thread.handle, &context))
+                    depth = Unwind(context, thread.tib, *modules, thread.frames.data());
+                ResumeThread(thread.handle);
+            }
+            thread.frames.resize(size_t(depth));
+            CloseHandle(thread.handle);
+        }
+        std::string out;
+        {
+            std::lock_guard lock(g_symbolLock);
+            Symbolizer& symbols = SharedSymbols();
+            for (const Thread& thread : threads)
+            {
+                Appendf(out, "[host] thread %lu (%s):\n", thread.tid, thread.name.empty() ? "unnamed" : thread.name.c_str());
+                for (size_t i = 0; i < thread.frames.size() && i < maxDepth; i++)
+                {
+                    // Return addresses point after the call: the call itself is the byte before.
+                    const uintptr_t address = uintptr_t(thread.frames[i]) - (i ? 1 : 0);
+                    Appendf(out, "[host]   #%zu %s\n", i, symbols.Describe(*modules, address).c_str());
+                }
+            }
+        }
+        fputs(out.c_str(), stderr);
+        fflush(stderr);
     }
 
     void NameThread(const char* format, ...)
