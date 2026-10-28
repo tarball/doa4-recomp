@@ -26,14 +26,16 @@ and Git, `setup.ps1` checks your disc image, recompiles the game's code and buil
 
 ## This repository
 
-Each commit is a release, tagged by its date (`20261027`; a second release on the same day is `20261027.2`), and the
-release of the same name has its zip. Its notes name the XenonRecomp commit it was built with.
+Each commit is a release, tagged by its date and its own short hash (`v2026.10.27-e3a1ced`), and the release of the
+same name has its zip. Its notes name the XenonRecomp commit it was built with.
 
 ## Licenses
 
-A release's `licenses` folder has the licenses of what it ships and what's compiled into it: LLVM's clang and lld-link
-(with libxml2's notice), XenonRecomp (with GNU binutils' PowerPC disassembler, GPL-2.0 or later, and libmspack,
-LGPL-2.1), FFmpeg (LGPL), simde, xxHash, fmt, toml++, tiny-AES-c and TinySHA1. This project's own license is still to
-be chosen.
+This project is free software under the GNU General Public License, version 3: see [LICENSE](LICENSE).
+
+A release's `licenses` folder has that license and those of what it ships and what's compiled into it: LLVM's clang
+and lld-link (with libxml2's notice), XenonRecomp (with GNU binutils' PowerPC disassembler, GPL-2.0 or later,
+libmspack, LGPL-2.1, and code from Xenia), FFmpeg (LGPL), simde, xxHash, fmt, toml++, tiny-AES-c and TinySHA1, and
+Xenia's (BSD-3-Clause), whose work parts of the runtime follow.
 
 This project isn't affiliated with or endorsed by Koei Tecmo, Team NINJA or Microsoft.

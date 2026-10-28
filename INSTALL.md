@@ -83,9 +83,9 @@ To build the game yourself rather than download it:
    git clone --recursive --branch doa4 https://github.com/tarball/XenonRecomp.git XenonRecomp
    ```
 
-   That's the latest release. Each release is a tag (its date, such as `20261027`) whose notes name the XenonRecomp
-   commit it was built with: to build an earlier one, `git checkout <tag>` in `doa4-recomp`, and that commit in
-   `XenonRecomp` (`git checkout <commit>`, then `git submodule update --recursive`).
+   That's the latest release. Each release is a tag (its date and commit, such as `v2026.10.27-e3a1ced`) whose notes
+   name the XenonRecomp commit it was built with: to build an earlier one, `git checkout <tag>` in `doa4-recomp`, and
+   that commit in `XenonRecomp` (`git checkout <commit>`, then `git submodule update --recursive`).
 
 3. Run the setup from the `doa4-recomp` folder. It asks for your disc image (or pass `-Iso`):
 

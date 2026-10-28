@@ -17,8 +17,8 @@
 # It stops if anything else is in it. tools\buildmodule.ps1 -Root build\package\doa4-recomp is the player's build by
 # hand, for a dry run.
 # Usage: powershell -ExecutionPolicy Bypass -File tools\package.ps1 [-Version <name>] [-NoBuild] [-NoZip]
-#   -Version names the release (default: git describe): a release's is its tag in the release repository, the date
-#   (20261027), which the README's source link names. -NoBuild packages the Release build as it is.
+#   -Version names the release (default: git describe): a release's is its tag in the release repository, its date and
+#   commit (v2026.10.27-e3a1ced), which the README's source link names. -NoBuild packages the Release build as it is.
 param(
     [string]$Version = '',
     [switch]$NoBuild,
@@ -68,12 +68,12 @@ $build = Join-Path $root 'build\Release'
 foreach ($file in "$executable.exe", $launcher, "$($executable)_ppc.dll", "module\$executable.def", "module\$($executable)_ppc.def") {
     if (-not (Test-Path (Join-Path $build $file))) { throw "No $file in ${build}: build.cmd Release first" }
 }
-# The commit (or a version tag), not the release/<date> tags that record a release's commit, whose slash a file name
+# The commit (or a version tag), not the release/<name> tags that record a release's commit, whose slash a file name
 # can't have.
 if (-not $Version) { $Version = (& git -C $root describe --always --dirty --tags --exclude 'release/*').Trim() }
 $xenonCommit = (& git -C $xenonRecomp rev-parse HEAD).Trim()
 # A release's source is its tag in the release repository.
-$source = if ($Version -match '^\d{8}(\.\d+)?$') { "$sourceRepository/tree/$Version" } else { $sourceRepository }
+$source = if ($Version -match '^v\d{4}\.\d{2}\.\d{2}-[0-9a-f]{7,}$') { "$sourceRepository/tree/$Version" } else { $sourceRepository }
 
 $packages = Join-Path $root 'build\package'
 $package = Join-Path $packages $folderName
@@ -107,11 +107,14 @@ Copy-Item (Join-Path $build "module\$executable.def"), (Join-Path $build "module
 $moduleHash = (Get-FileHash (Join-Path $build "$($executable)_ppc.dll") -Algorithm SHA256).Hash.ToLowerInvariant()
 Set-Content (Join-Path $recomp "$($executable)_ppc.sha256") $moduleHash -Encoding ASCII
 
-# Licenses of what's shipped or compiled in. In doa4.exe: xxHash (BSD-2); in the module the player builds: XenonRecomp's
+# Licenses: this project's, the GPL-3.0 (LICENSE), and those of what's shipped or compiled in. In doa4.exe: xxHash
+# (BSD-2), and parts that follow Xenia's (BSD-3-Clause); in the module the player builds: XenonRecomp's
 # ppc_context.h (MIT) and simde (MIT); beside it: FFmpeg (LGPL), LLVM's clang and lld-link (Apache 2.0 with the LLVM
 # exception), and XenonRecomp.exe (MIT), with what's compiled into it: its PowerPC disassembler, binutils' (GPL-2.0 or
-# later), libmspack's LZX decoder (LGPL-2.1), fmt and toml++ (MIT), tiny-AES-c (public domain), TinySHA1 and xxHash.
-# And lld-link.exe holds libxml2 2.9.12 (MIT, for merging manifests): tools\licenses\libxml2.txt.
+# later), libmspack's LZX decoder (LGPL-2.1), Xenia's XEX patcher and export tables (BSD-3-Clause:
+# tools\licenses\xenia.txt), fmt and toml++ (MIT), tiny-AES-c (public domain), TinySHA1 and xxHash. And lld-link.exe
+# holds libxml2 2.9.12 (MIT, for merging manifests): tools\licenses\libxml2.txt.
+Copy-Item (Join-Path $root 'LICENSE') (Join-Path $licenses "$folderName (GPL-3.0).txt")
 $third = Join-Path $xenonRecomp 'thirdparty'
 Copy-Item (Join-Path $xenonRecomp 'LICENSE.md') (Join-Path $licenses 'XenonRecomp.txt')
 Copy-Item (Join-Path $third 'simde\COPYING') (Join-Path $licenses 'simde.txt')
@@ -128,6 +131,7 @@ Set-Content (Join-Path $licenses 'binutils (XenonRecomp''s PowerPC disassembler)
     "and XenonRecomp's, is $xenonRepository at commit $xenonCommit (thirdparty\disasm). Its notice:`r`n`r`n$binutils")
 Copy-Item (Join-Path $root 'tools\licenses\GPL-2.0.txt') (Join-Path $licenses 'GPL-2.0.txt')
 Copy-Item (Join-Path $root 'tools\licenses\libxml2.txt') (Join-Path $licenses 'libxml2.txt')
+Copy-Item (Join-Path $root 'tools\licenses\xenia.txt') (Join-Path $licenses 'Xenia.txt')
 Get-ChildItem (Join-Path $llvm 'LICENSE-*.TXT') | ForEach-Object { Copy-Item $_.FullName (Join-Path $licenses "LLVM $($_.Name)") }
 $ffmpegBuild = [regex]::Match((Get-Content -Raw (Join-Path $root 'tools\getffmpeg.ps1')), "(?m)^\`$name = '([^']+)'").Groups[1].Value
 $ffmpegLicense = (Get-Content -Raw (Join-Path $ffmpeg 'LICENSE.txt')).TrimEnd()
@@ -174,7 +178,8 @@ folder, with your saves and settings, stays.
 
 Source: $source
 Its recompiler: $xenonRepository, branch doa4, at commit $xenonCommit
-The licenses of what's in this folder are in the licenses folder.
+This project is free software under the GNU General Public License, version 3 (licenses\$folderName (GPL-3.0).txt).
+The licenses of the rest of what's in this folder are in the licenses folder too.
 "@
 Set-Content (Join-Path $package 'README.txt') -Encoding ASCII ($readme -replace "`r?`n", "`r`n")
 
