@@ -1,11 +1,13 @@
 #include "netplay/frame.h"
 
+#include "gpu/command_processor.h"
 #include "guest_abi.h"
 #include "kernel/threads.h"
 #include "log.h"
 #include "netplay/game_state.h"
 #include "netplay/heaps.h"
 #include "netplay/page_log.h"
+#include "netplay/replay.h"
 #include "netplay/rollback_test.h"
 #include "netplay/savestates.h"
 #include "netplay/session.h"
@@ -45,6 +47,12 @@ namespace netplay
         bool g_flow = false;
         std::atomic<uint64_t> g_fightFrame{ ~0ull };
         PPCContext* g_boundaryContext = nullptr;      // during a boundary (main thread)
+        // The main thread's work a frame (LastFrameWork): the last boundary's end, the main thread's waits for the GPU
+        // then, whether the frame after it was a replay's, and the last frame's work (main thread).
+        std::chrono::steady_clock::time_point g_boundaryEnd{};
+        uint64_t g_waitedAtEnd = 0;
+        bool g_replayedFrame = false;
+        FrameWork g_lastWork;
 
         // A game thread other than the calling one that isn't blocked in a wait, if any.
         struct RunningThread
@@ -292,6 +300,19 @@ namespace netplay
 
     void FrameBoundary(PPCContext& ctx)
     {
+        // The frame that just ran: its work, without the main thread's waits for the GPU.
+        {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t waited = gpu::ThreadWaitedMicroseconds();
+            g_lastWork = FrameWork{};
+            if (g_boundaryEnd != std::chrono::steady_clock::time_point{})
+            {
+                const int64_t wall = std::chrono::duration_cast<std::chrono::microseconds>(now - g_boundaryEnd).count();
+                g_lastWork.known = true;
+                g_lastWork.replayed = g_replayedFrame;
+                g_lastWork.microseconds = uint64_t(std::max<int64_t>(wall - int64_t(waited - g_waitedAtEnd), 0));
+            }
+        }
         g_boundaryContext = &ctx;
         // A session's (and a rollback test's, which must play as a session would: its runs compare by fight frame).
         if (session::Configured() || rollbacktest::Enabled())
@@ -317,6 +338,14 @@ namespace netplay
         // A session's rollback (which may load a savestate too) and the pads of the frame about to run.
         session::AfterSavestates(frame);
         g_boundaryContext = nullptr;
+        g_replayedFrame = replay::Active();
+        g_waitedAtEnd = gpu::ThreadWaitedMicroseconds();
+        g_boundaryEnd = std::chrono::steady_clock::now();
+    }
+
+    FrameWork LastFrameWork()
+    {
+        return g_lastWork;
     }
 
     void LogFightChecksum(uint64_t fightFrame, uint64_t checksum)

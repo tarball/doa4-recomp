@@ -1072,14 +1072,26 @@ namespace gpu
         return statistics;
     }
 
+    static thread_local uint64_t t_waitedMicroseconds = 0; // WaitForProgress's blocking, the calling thread's
+
     void WaitForProgress()
     {
         // Progress since this thread's last call counts: its wait loop has checked its condition since then.
         thread_local uint64_t seen = UINT64_MAX;
         uint64_t now = g_progress.Value();
         if (now == seen)
+        {
+            const auto start = std::chrono::steady_clock::now();
             now = g_progress.Wait(now, 1);
+            t_waitedMicroseconds +=
+                uint64_t(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        }
         seen = now;
+    }
+
+    uint64_t ThreadWaitedMicroseconds()
+    {
+        return t_waitedMicroseconds;
     }
 
     uint64_t WaitForRecordedDraws(uint64_t limitMicroseconds)

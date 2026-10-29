@@ -3,7 +3,7 @@
 // Netplay sessions (route 2, ANALYSIS.md Phase 6): two players on two PCs, each with one controller, play the game's
 // local versus fights with the other player's input fed from the network. NETPLAY=host:<port> waits for the other player
 // on that UDP port, and NETPLAY=join:<address>:<port> connects to them; the host plays player 1, the other player 2.
-// NETPLAY_DELAY=<frames> (default 3, the host's) is the input delay.
+// The host chooses each segment's input delay (below); NETPLAY_DELAY=<frames> on the host fixes it instead.
 //
 // A session is for the game's multiplayer flow (netplay::InFlow: Versus mode, from its menu through the entry,
 // character and stage select, the fights and the screens after them), and goes straight into it. Each machine boots on
@@ -12,16 +12,35 @@
 // the player doesn't see for long). Nothing of that is exchanged. The flow both machines play in lockstep, the host's
 // controller as player 1 and the other's as player 2 on both. The flow's segments (netplay::CurrentSegment): its menu
 // screens, from each one's first frame past its loading until it starts to leave, and its fights, from their first
-// frame past loading until they end. In a segment each frame's local input is sent and applied NETPLAY_DELAY frames
-// later on both machines, and a machine waits at the frame boundary for the other's when it hasn't come. A segment's
-// first NETPLAY_DELAY frames get no one's input, so each machine gets to it in its own time and the faster one waits
-// there: the first to get to Versus waits at its menu's frame NETPLAY_DELAY, its window saying so, until the other gets
-// there too. Between the flow's segments, while a screen or a fight loads or a screen leaves, both players' pads are at
-// rest. The session numbers the flow's segments from 0 in the order both play them (each machine numbers all of its own
-// from boot: Segment::number). Nobody leaves the flow: what would take the game out of it (GameState::flowBlockedButtons:
-// DOA4's B on Versus's menu, Quit in the pause and result menus) is taken out of both players' input on both machines.
-// Should the game leave it all the same, both leave together (a press is both players' at the same frame), and the
-// game's presses take each back into it.
+// frame past loading until they end. In a segment each frame's local input is sent and applied `delay` frames later on
+// both machines (the segment's input delay), and a machine waits at the frame boundary for the other's when it hasn't
+// come. A segment's first `delay` frames get no one's input, so each machine gets to it in its own time and the faster
+// one waits there: the first to get to Versus waits at its menu's frame `delay`, its window saying so, until the other
+// gets there too. Between the flow's segments, while a screen or a fight loads or a screen leaves, both players' pads
+// are at rest. The session numbers the flow's segments from 0 in the order both play them (each machine numbers all of
+// its own from boot: Segment::number). Nobody leaves the flow: what would take the game out of it
+// (GameState::flowBlockedButtons: DOA4's B on Versus's menu, Quit in the pause and result menus) is taken out of both
+// players' input on both machines. Should the game leave it all the same, both leave together (a press is both
+// players' at the same frame), and the game's presses take each back into it.
+//
+// The input delays (session.cpp: Choose). Both machines play a segment with the same delay, the host's choice, which it
+// makes for each segment from what both measure: as it ends the segment before (the joining machine hears of it while
+// both load the next; one that gets there first waits at its frame 0 until it has), the flow's first once connected
+// and a few round trips measured. Choices are final, and the host's packets carry its latest: the round trip, measured
+// from the handshake on (the alive packets echo the other's clock too), its mean and 95th percentile over the last 10 s;
+// and each machine's measures, which every packet of its carries: its main thread's work a frame in the flow's menus and
+// in its fights (netplay::LastFrameWork, without its waits for the GPU) and with rollback a replayed frame's time, a
+// load's and the load's wait for the GPU's draws. A segment in lockstep (a menu screen, a fight without rollback) takes
+// the delay 60 frames a second needs at the mean round trip, ceil((RTT / 2 + work) / frame) - 1, and a frame to spare, or
+// what the 95th percentile needs if more; a fight that rolls back the smallest that keeps its rollbacks (the frames after
+// which the other's input comes, less the delay) within what the slower machine fits beside a frame (FitsFor: the first
+// replayed frame where the present frame would have waited for its vblank, and the others with the present frame in the
+// frame after, leaving the GPU 3 ms; a replayed frame as measured, else as a fight's frame's work, before the first fight
+// the menus' times 1.6), and at least 2, or fewer where the other's input takes fewer frames (no rollback is needed then:
+// 1 on a local network). A delay never changes inside a segment.
+// NETPLAY_DELAY and NETPLAY_FIGHT_DELAY on the host fix them; the joining machine's don't apply. Each segment's start
+// logs its delay and why, on both machines; each packet also says the delay its sender plays the segment with, and
+// machines that differ there end the session.
 //
 // Each segment's frames carry a checksum (netplay::FightChecksum in fights, GameState::menuChecksum in the menus), and
 // the segments' identities (which fight or screen) are compared. A fight that differs is logged as a desync; menus that
@@ -63,27 +82,27 @@
 // its waits. DEBUG_NET_CONDITIONS, DEBUG_NET_OUTAGE and DEBUG_STALL (session.cpp) make the packets go out as over a
 // network, or the game stall.
 //
-// Rollback in fights (NETPLAY_ROLLBACK=1 on both machines: a switch the handshake compares), as GGPO plays: the menus
-// and a fight's first frames stay in lockstep, and from the fight's frame NETPLAY_FIGHT_DELAY on (default 2, the
-// host's), where the first machine there waits for the other as in lockstep, each frame runs at once, with the other
-// player's input where it has come and a prediction where it hasn't (the last input that came, as GGPO predicts). The
-// game is saved at every frame boundary (netplay/savestates.h). When the other player's input comes for a frame that ran
-// on another, the game loads that frame's savestate and replays the frames since to the present with the input as it
-// came (netplay/replay.h: their rendering discarded, the libraries' calls answered from the journal where the replay
-// makes the same, made where it doesn't, the abandoned timeline's sounds faded out), then runs the present frame. A
-// machine runs at most NETPLAY_WINDOW frames (default 8, the host's) past the last frame whose input from the other
-// it has; further ahead, it waits, as GGPO does. The frames in which a press can end the fight (GameState::fightMenu:
-// DOA4's pause menu, and the match's result with the menu after it) run only with the other's input as it came (they
-// wait for it, lockstep), so a fight ends at the same frame on both machines. Time sync, as GGPO's: each machine
-// measures how long before it needed them the other's inputs come on average (its slack, sent with its packets), and
-// the machine whose slack is the smaller by more than a few milliseconds runs ahead by half the difference: it slows
-// down by that much, its vblanks (which pace the game's frames) coming later by at most 2 ms each (gpu::DelayVblanks),
-// so that neither runs ahead for long and both roll back alike; after a wait of more than 100 ms (an outage, a stall)
-// both machines' slacks start afresh. Checksums are compared at the frames whose inputs from both machines are final (a
-// frame's checksum, at its boundary, once the inputs of the frames before it came and the frames ran with them), and
-// desyncs are dumped as in lockstep. NETPLAY_DELAY stays the menus' input delay. Lockstep is the default
-// (ANALYSIS.md, Phase 6, Rollback in sessions' fights: rollback plays better from about 30 ms on with fast PCs, but a
-// slower PC's replays may not fit in a frame).
+// Rollback in fights (the default; NETPLAY_ROLLBACK=0 on both machines plays them in lockstep instead: a switch the
+// handshake compares), as GGPO plays: the menus and a fight's first frames stay in lockstep, and from the fight's frame
+// `delay` on (the host's choice, above), where the first machine there waits for the other as in lockstep, each frame
+// runs at once, with the other player's input where it has come and a prediction where it hasn't (the last input that
+// came, as GGPO predicts). The game is saved at every frame boundary (netplay/savestates.h). When the other player's
+// input comes for a frame that ran on another, the game loads that frame's savestate and replays the frames since to
+// the present with the input as it came (netplay/replay.h: their rendering discarded, the libraries' calls answered
+// from the journal where the replay makes the same, made where it doesn't, the abandoned timeline's sounds faded out),
+// then runs the present frame. A machine runs at most NETPLAY_WINDOW frames (default 8, the host's) past the last frame
+// whose input from the other it has; further ahead, it waits, as GGPO does. The frames in which a press can end the
+// fight (GameState::fightMenu: DOA4's pause menu, and the match's result with the menu after it) run only with the
+// other's input as it came (they wait for it, lockstep), so a fight ends at the same frame on both machines. Time sync,
+// as GGPO's: each machine measures how long before it needed them the other's inputs come on average (its slack, sent
+// with its packets), and the machine whose slack is the smaller by more than a few milliseconds runs ahead by half the
+// difference: it slows down by that much, its vblanks (which pace the game's frames) coming later by at most 2 ms each
+// (gpu::DelayVblanks), so that neither runs ahead for long and both roll back alike; after a wait of more than 100 ms
+// (an outage, a stall) both machines' slacks start afresh. Checksums are compared at the frames whose inputs from both
+// machines are final (a frame's checksum, at its boundary, once the inputs of the frames before it came and the frames
+// ran with them), and desyncs are dumped as in lockstep. Rollback is the default (the user's choice, 2026-10-28;
+// ANALYSIS.md, Phase 6, The input delays a session chooses: with the delays chosen, both modes keep 60 frames a second,
+// and rollback shows a press sooner from about 30 ms on).
 #include <cstdint>
 #include <optional>
 
@@ -100,7 +119,7 @@ namespace netplay::session
 
     // Whether NETPLAY is set.
     bool Configured();
-    // Whether NETPLAY is set with NETPLAY_ROLLBACK=1: fights roll back, which needs the game heap from boot
+    // Whether NETPLAY is set without NETPLAY_ROLLBACK=0: fights roll back, which needs the game heap from boot
     // (netplay/heaps.h, for the savestates).
     bool RollbackConfigured();
     // The input module's sample of the local player's controller (pad 1, the keyboard and scripted presses).
@@ -123,4 +142,21 @@ namespace netplay::session
     bool PlaysFlow();
     // As the game's window closes: tells the other player this one leaves.
     void Shutdown();
+
+    // The input delays' formulas (session.cpp: Choose), apart for the runtime's tests. At a round trip (its mean and 95th
+    // percentile) and a frame's work, in microseconds: the frames after which an input is on the other machine (`late`),
+    // the delay lockstep needs for 60 frames a second (`needed`) and takes (with a frame to spare, or what the 95th
+    // percentile needs if more), and a fight that rolls back takes when a rollback fits `fits` frames beside a frame on
+    // the slower machine (at least 2, or `late` if fewer).
+    struct DelayChoice
+    {
+        uint32_t late = 0, needed = 0, lockstep = 0, rollback = 0;
+    };
+    DelayChoice DelaysFor(double roundTripUs, double roundTripHighUs, double workUs, uint32_t fits);
+    // The frames a rollback fits beside a frame on a machine whose replayed frame takes `replayFrameUs`, its present frame's
+    // work `presentWorkUs`, a load `loadUs` and the load's wait for the command processor to draw the frames recorded
+    // `drawWaitUs`, at most `window`: the wait, the load and the first replayed frame take the time the present frame would
+    // have waited for its vblank (none fits if they don't), and the others and the present frame the next frame, less
+    // 3 ms for the GPU to draw it.
+    uint32_t FitsFor(double replayFrameUs, double presentWorkUs, double loadUs, double drawWaitUs, uint32_t window);
 }

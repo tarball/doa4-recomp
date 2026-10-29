@@ -198,7 +198,7 @@ namespace
             return 1;
         }
         output.Line(L"Starting the game" + (netplay.empty() ? std::wstring() : L" (" GAME_PREFIX "_NETPLAY=" + FromUtf8(netplay) +
-            (choices.rollback ? L", " GAME_PREFIX "_NETPLAY_ROLLBACK=1" : L"") + L")") + L", its data in " + folder.data);
+            L", " GAME_PREFIX "_NETPLAY_ROLLBACK=" + (choices.rollback ? L"1" : L"0") + L")") + L", its data in " + folder.data);
         unsigned long exitCode = 0;
         if (const std::wstring failure = StartGame(folder, choices, options.wait, &exitCode); !failure.empty())
         {

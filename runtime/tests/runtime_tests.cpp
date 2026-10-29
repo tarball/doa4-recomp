@@ -13,6 +13,7 @@
 #include "kernel/threads.h"
 #include "netplay/frame.h"
 #include "netplay/replay.h"
+#include "netplay/session.h"
 #include "page_heap.h"
 #include "settings.h"
 #include "util/image.h"
@@ -1204,6 +1205,52 @@ static void test_journal_divergence()
     journal::Describe({});
 }
 
+// A session's input delays (netplay/session.h: DelaysFor and FitsFor), at the points session 2's and session 9's
+// matrices measured on this PC (ANALYSIS.md, Phase 6, Route 2 under network conditions; Rollback in sessions' fights):
+// lockstep's delay with a frame to spare, and a rollback fight's from what fits.
+static void test_netplay_delays()
+{
+    namespace session = netplay::session;
+    // What fits beside a frame, as measured (the matrix of The input delays a session chooses): two instances on 16 logical
+    // processors, a replayed frame 2.18 ms, a present one 2.13, a load 0.92 after 3.67 ms of waiting for the GPU's draws:
+    // 6 frames; on 2 logical processors, 5.49, 5.21, 0.82 and 3.57 ms: 2; one instance a PC (a replayed frame 1.75 ms): 7.
+    CHECK(session::FitsFor(2180, 2130, 920, 3670, 8) == 6, "%u", session::FitsFor(2180, 2130, 920, 3670, 8));
+    CHECK(session::FitsFor(5490, 5210, 820, 3570, 8) == 2, "%u", session::FitsFor(5490, 5210, 820, 3570, 8));
+    CHECK(session::FitsFor(1750, 1800, 800, 3500, 8) == 7, "%u", session::FitsFor(1750, 1800, 800, 3500, 8));
+    // The wait, the load and a first replayed frame longer than a frame: none fits; nor with a present frame that leaves
+    // the GPU no time; at most the window.
+    CHECK(session::FitsFor(13000, 13000, 1000, 3500, 8) == 0, "%u", session::FitsFor(13000, 13000, 1000, 3500, 8));
+    CHECK(session::FitsFor(8000, 14000, 1000, 3500, 8) == 0, "%u", session::FitsFor(8000, 14000, 1000, 3500, 8));
+    CHECK(session::FitsFor(500, 500, 500, 2000, 8) == 8, "%u", session::FitsFor(500, 500, 500, 2000, 8));
+    // Round trips (mean, 95th percentile) with 2 ms of work: lockstep needs ceil((RTT / 2 + 2) / 16.7) - 1, and takes one
+    // more (session 9's best: 3 at 70 ms, 4-5 at 130, 7 at 210, 10 at 310); rollback with 6 fitting, at least 2 (or the
+    // frames the other's input takes, if fewer), and 4 at 310 ms (session 9's best).
+    struct Point
+    {
+        double rtt, high;
+        uint32_t late, needed, lockstep, rollback6, rollback1;
+    };
+    const Point points[] = {
+        { 100, 300, 1, 0, 1, 1, 1 },               // no latency: no rollback at 1
+        { 70000, 78000, 3, 2, 3, 2, 2 },           // 30 ms, 10 ms of jitter
+        { 130000, 138000, 5, 4, 5, 2, 4 },         // 60 ms
+        { 210000, 218000, 7, 6, 7, 2, 6 },         // 100 ms
+        { 310000, 318000, 10, 9, 10, 4, 9 },       // 150 ms
+        { 410000, 418000, 13, 12, 13, 7, 12 },     // 200 ms
+        { 210000, 280000, 7, 6, 8, 2, 6 },         // a 95th percentile far above the mean: what it needs
+    };
+    for (const Point& p : points)
+    {
+        const session::DelayChoice choice = session::DelaysFor(p.rtt, p.high, 2000, 6);
+        CHECK(choice.late == p.late && choice.needed == p.needed && choice.lockstep == p.lockstep && choice.rollback == p.rollback6,
+            "%.0f us: late %u, needed %u, lockstep %u, rollback %u", p.rtt, choice.late, choice.needed, choice.lockstep, choice.rollback);
+        CHECK(session::DelaysFor(p.rtt, p.high, 2000, 1).rollback == p.rollback1, "%.0f us: rollback %u with 1 fitting", p.rtt,
+            session::DelaysFor(p.rtt, p.high, 2000, 1).rollback);
+    }
+    // Bounded: a round trip of 10 s takes the most delay there is (30 frames).
+    CHECK(session::DelaysFor(10e6, 10e6, 2000, 0).lockstep == 30 && session::DelaysFor(10e6, 10e6, 2000, 0).rollback == 30);
+}
+
 // The store map's miss handler (ppc_overrides.h), which the generated code calls with every register live
 // (preserve_all): it must give them all back whole, the YMM registers' upper halves too, where the generated code keeps
 // VMX's floating point in double precision. Clang ended it with a vzeroupper, which cleared them after restoring them:
@@ -1335,6 +1382,7 @@ int main()
     RUN(test_xma_decoding);
     RUN(test_journal_divergence);
     RUN(test_store_miss_preserves_registers);
+    RUN(test_netplay_delays);
 
     printf("%d checks, %d failures\n", g_checks, g_failures);
     return g_failures != 0;

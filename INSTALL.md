@@ -52,6 +52,9 @@ Netplay plays Versus with another PC: choose Netplay in the launcher.
   has one) and port.
 - **Both players choose the same for fights:** Rollback, the default, which plays better over the internet, or
   Lockstep, which waits for both players' moves every frame. Games that don't match don't connect.
+- **The input delay,** how many frames a press takes to show on both PCs, is the game's choice for each screen and
+  fight, from the connection's round trip (and with Rollback, from how fast both PCs replay frames): there's nothing
+  to set.
 - Both start the game. It goes straight into Versus once both have booted; either player can stop by closing the game.
 - **Only play with people you trust, on a network you trust:** netplay hasn't had a security review yet.
 

@@ -52,7 +52,7 @@ namespace netplay::session
         using Clock = std::chrono::steady_clock;
         using std::chrono::microseconds;
 
-        constexpr uint16_t kVersion = 7;
+        constexpr uint16_t kVersion = 8;
         constexpr uint32_t kMaxPads = 64;       // pads a segment packet carries at most
         constexpr uint32_t kChecksumsSent = 8;  // the last checksums each segment packet carries
         constexpr auto kHelloInterval = std::chrono::milliseconds(250);
@@ -75,6 +75,7 @@ namespace netplay::session
         // A segment's key: its number among the flow's segments the session played (the same on both machines), with
         // kFightKey for a fight.
         constexpr uint32_t kFightKey = 0x80000000;
+        constexpr uint32_t kNoKey = 0xFFFFFFFF;      // no segment
         constexpr uint32_t kGapPackets = 0xFFFFF;    // the pads' packet number's low bits between segments
         constexpr uint32_t kFrameWindow = 1u << 24;  // a segment's frames a packet may name (inputs, checksums)
         constexpr size_t kSettingsSize = GameState::kMaxPlayerSettings;
@@ -95,6 +96,36 @@ namespace netplay::session
         constexpr double kSyncMaxMs = 9 * 16.667;
         constexpr uint32_t kSyncSettleFrames = 64;
         constexpr uint64_t kSlackResetMicroseconds = 100000; // a wait this long in a fight that rolls back starts the slacks afresh
+        // The input delays the host chooses for each segment of the flow (Choose; session.h). A frame (us); the least work
+        // a frame is reckoned to take in the formulas (session 2's 2 ms: the time from a frame's start to its input being
+        // needed on the other machine includes the work of the frame before); the round trips the choice looks at (the
+        // last 10 s', or at least the last 16); the round trips the first segment waits for, at most 3 s; the replayed
+        // frames (after a rollback's first) a machine must have measured before their time counts instead of the estimate
+        // from its frames' work, and the frames' work measured before that counts; the frames a rollback fits when
+        // nothing is measured (a cautious guess: a fast PC fits 6); a load's time before one is measured; the rollback
+        // fights' least delay (session 9's default; fewer where the other's input comes sooner: DelaysFor); and the most
+        // a measurement may say (us).
+        constexpr double kFrameMicroseconds = 1e6 / 60.0;
+        constexpr double kLeastWorkMicroseconds = 2000;
+        constexpr auto kRoundTripWindow = std::chrono::seconds(10);
+        constexpr size_t kRoundTripsKept = 4096, kLeastRoundTrips = 16;
+        constexpr uint64_t kFirstRoundTrips = 8;
+        constexpr auto kFirstRoundTripWait = std::chrono::seconds(3);
+        constexpr uint64_t kReplayFramesMeasured = 20, kWorkFramesMeasured = 60;
+        // A fight's frame (run as the present, or replayed) against a frame of the flow's menus, which is all a machine has
+        // measured before its first fight: on this PC 2.1 ms against 1.6 on 16 logical processors and 5.2-5.5 against 3.3 on
+        // 2 (the fights' frames are heavier, and more so with fewer processors): the cautious end.
+        constexpr double kFightPerMenuWork = 1.6;
+        constexpr uint32_t kDefaultFits = 4;
+        // Before a machine's loads are measured: a load's time, and its wait for the command processor to draw the frames
+        // recorded (the GPU's drawing of a frame after its vblank: 3.4-3.7 ms here). And what a rollback leaves the GPU to
+        // draw the present frame before its vblank (Fits).
+        constexpr double kDefaultLoadMicroseconds = 1000, kDefaultDrawWaitMicroseconds = 3500;
+        constexpr double kDrawMarginMicroseconds = 3000;
+        constexpr uint32_t kLeastFightDelay = 2;
+        constexpr uint32_t kMaxMeasureMicroseconds = 1'000'000;
+        constexpr uint32_t kMaxRoundTripMicroseconds = 10'000'000;
+        constexpr int64_t kClockBucketSeconds = 5; // the two clocks' offsets, the least delayed packet's of each (DriftPpm)
 
         enum class Type : uint16_t
         {
@@ -146,14 +177,68 @@ namespace netplay::session
             uint16_t delay;
             Identity identity;
         };
+        // The host's input delays: fixed by its variables (kFixedLockstep, kFixedRollback), or chosen for each segment of
+        // the flow (Delays, in its packets). The window always applies.
+        constexpr uint8_t kFixedLockstep = 1, kFixedRollback = 2;
         struct Welcome
         {
             Header header;
             uint32_t seed;
-            uint16_t delay;
-            uint16_t fightDelay; // with rollback (session.h): the fights' input delay
+            uint16_t delay;      // the lockstep segments' input delay, if fixed
+            uint16_t fightDelay; // with rollback (session.h): the fights' input delay, if fixed
             uint16_t window;     // and the window
+            uint8_t fixed;       // kFixedLockstep, kFixedRollback
             Identity identity;
+        };
+        // A machine's measures of its own pace, in its segment and alive packets: the host chooses the input delays from
+        // both machines' (Choose), and each machine's log shows the other's. 0: not measured yet.
+        struct Measures
+        {
+            // Its main thread's work a frame (netplay::LastFrameWork), mean, in the flow's menu screens and in its fights (the
+            // frames run as the present).
+            uint32_t menuWorkUs, fightWorkUs;
+            uint32_t replayFrameUs; // in fights that roll back: a replayed frame's time, mean (a rollback's frames after its first)
+            uint32_t replayFrames;  // and how many were measured
+            uint32_t loadUs;        // a savestate's load, mean
+            uint32_t drawWaitUs;    // and its wait for the command processor to draw the frames recorded, mean
+        };
+        // How a delay was chosen.
+        enum class How : uint8_t
+        {
+            kDefault,   // nothing measured yet: a cautious default
+            kChosen,    // from the round trip and the machines' measures
+            kFixed,     // the host's variable (NETPLAY_DELAY, NETPLAY_FIGHT_DELAY)
+        };
+        // Where a machine's reckoning of the frames a rollback fits beside a frame came from (Fits).
+        enum class FitsFrom : uint8_t
+        {
+            kDefault,   // nothing measured: kDefaultFits
+            kFrameWork, // its frames' work, as an estimate of a replayed frame's
+            kReplays,   // its replayed frames
+        };
+        // The input delays of a segment of the flow, which the host chooses as it ends the segment before (the first
+        // segment's as it starts it, once connected): the host's packets carry its latest choice, and the joining machine
+        // plays the segment with them. A choice is final: both machines play the segment with it (session.h).
+        struct Delays
+        {
+            uint32_t segment = kNoKey;  // the segment's number among the flow's (Ordinal)
+            uint8_t lockstep = 0;       // its delay if it runs in lockstep (a menu screen, or a fight without rollback)
+            uint8_t rollback = 0;       // and if it's a fight that rolls back
+            uint8_t lockstepHow = 0, rollbackHow = 0; // How
+            // What they were chosen from: the delay 60 frames a second needs at the round trip in lockstep (without the
+            // frame to spare); the frames after which the other's input comes; the frames a rollback fits beside a frame on
+            // each machine, and where that came from (FitsFrom); the round trip (mean and 95th percentile) and the frames'
+            // work (the larger machine's, at least kLeastWorkMicroseconds).
+            uint8_t needed = 0, late = 0;
+            uint8_t fitsHost = 0, fitsJoining = 0, fitsHostFrom = 0, fitsJoiningFrom = 0;
+            uint32_t roundTripUs = 0, roundTripHighUs = 0, workUs = 0;
+        };
+        // What every segment and alive packet carries besides: the sender's measures, and from the host, its latest choice
+        // of delays.
+        struct Pace
+        {
+            Measures measures;
+            Delays delays;
         };
         struct Refuse
         {
@@ -177,6 +262,7 @@ namespace netplay::session
             uint32_t frame;  // its frame
             uint32_t screen; // a menu screen's identity
             uint8_t where;   // Where
+            Pace pace;
         };
         struct Bye
         {
@@ -197,10 +283,12 @@ namespace netplay::session
             uint16_t checksums;
             int32_t slack;      // the sender's slack in a fight (LocalSlack), in microseconds, or kNoSlack
             uint8_t setup;      // kSetupIncluded: the sender's fight setup follows; kSetupReceived: the sender has the receiver's
+            uint8_t delay;      // the input delay the sender plays the segment with
             // The sender's player's settings for the flow (GameState::PlayerSettings), as it entered the flow: `size`
             // bytes, 0 if none.
             uint8_t settingsSize;
             uint8_t settings[kSettingsSize];
+            Pace pace;
         };
         struct Checksum
         {
@@ -208,7 +296,6 @@ namespace netplay::session
             uint64_t checksum;
         };
 #pragma pack(pop)
-        constexpr uint32_t kNoKey = 0xFFFFFFFF;
 
         enum class State
         {
@@ -270,7 +357,10 @@ namespace netplay::session
             uint32_t number = 0;            // this machine's number for it (netplay::Segment)
             uint64_t startFrame = 0;        // the game frame of its frame 0
             uint32_t ordinal = 0;           // the flow's segments the session started before it
-            uint32_t delay = 0;             // its input delay: the session's, or with rollback a fight's (session.h)
+            uint32_t delay = 0;             // its input delay: the host's choice for it (Delays), lockstep's or a rollback fight's
+            bool delayKnown = false;        // (ResolveDelay, once connected)
+            bool peerDelayKnown = false;    // the joining machine: the host's delay for it, in the host's packets of it
+            uint32_t peerDelay = 0;
             std::map<uint32_t, Pad> local;
             std::map<uint32_t, RemoteInput> remote;
             std::map<uint32_t, uint64_t> localChecksums, remoteChecksums;
@@ -283,6 +373,11 @@ namespace netplay::session
             // A menu screen's waits for the other player's input after its frame `delay`, and the one at it, and its
             // checksums compared.
             uint64_t startWaitMicroseconds = 0, waits = 0, waitedMicroseconds = 0, longestWaitMicroseconds = 0, compared = 0;
+            // A menu screen's frame rate from its frame `delay` on (as a fight's: Statistics), and the round trips measured
+            // in it.
+            Clock::time_point settled{}, lastBoundary{};
+            uint64_t vblanks = 0, swaps = 0;
+            uint64_t roundTrips = 0, roundTripMicroseconds = 0;
         };
 
         // What the other machine sent of a segment this machine isn't in yet (it may be loading it, or still be on its
@@ -294,6 +389,8 @@ namespace netplay::session
             bool screenKnown = false;
             uint32_t screen = 0;
             Settings settings;
+            bool delayKnown = false; // the input delay the other machine plays it with
+            uint32_t delay = 0;
         };
 
         // What this machine sent of a segment it has ended, to answer the other machine while that is still in it: the
@@ -335,6 +432,14 @@ namespace netplay::session
             uint64_t depths[kMaxWindow + 2] = {};
             uint32_t deepest = 0;
             double loadMicroseconds = 0, longestLoadMicroseconds = 0, replayMilliseconds = 0, firstFrameMilliseconds = 0;
+            // A replayed frame's time, for the input delays (Measures): the replays' frames after their first, run back to
+            // back (the first waits out a vblank), and their time; the replay under way's frames run so far, its first
+            // frame's time, and whether it ran without waits or a rollback inside it (only those count).
+            double laterMilliseconds = 0;
+            uint64_t laterFrames = 0;
+            uint64_t replayRunFrames = 0;
+            double replayFirstMilliseconds = 0;
+            bool replayClean = false;
             double drawWaitMicroseconds = 0, longestDrawWaitMicroseconds = 0; // the loads' waits for the command processor
             uint64_t aheadFrames = 0, aheadSum = 0;
             uint32_t furthestAhead = 0;
@@ -362,6 +467,36 @@ namespace netplay::session
             bool rollback = false;
             uint32_t fightDelay = kDefaultFightDelay, window = kDefaultWindow;
             Rollback rb; // the current fight's
+            // The input delays (Choose): whether the host's variables fix lockstep's and the rollback fights' (`delay` and
+            // `fightDelay` then), the round trips measured from the handshake on (their arrival and microseconds, the
+            // newest last), this machine's measures (the flow's frames' work, a rollback's replayed frames after its
+            // first and the loads, before the current fight's), the other's from its packets, and the delays of the
+            // flow's segments, by number: the host's choices (on the joining machine, those it has heard of), the latest
+            // in the host's packets.
+            bool lockstepFixed = false, rollbackFixed = false;
+            struct RoundTrip
+            {
+                Clock::time_point arrival;
+                uint32_t microseconds;
+            };
+            std::deque<RoundTrip> roundTrips;
+            uint64_t roundTripCount = 0;
+            double menuWorkMicroseconds = 0, fightWorkMicroseconds = 0, replayMicroseconds = 0, loadMicroseconds = 0, drawWaitMicroseconds = 0;
+            uint64_t menuWorkFrames = 0, fightWorkFrames = 0, replayFrames = 0, loads = 0;
+            bool peerMeasuresKnown = false;
+            Measures peerMeasures{};
+            std::map<uint32_t, Delays> delays;
+            Delays latestDelays{};
+            bool delaysMismatchLogged = false, ignoredDelaysLogged = false;
+            // The two clocks (DriftPpm): the first offset of the other machine's clock from this one's in a packet, and the
+            // largest offset of every kClockBucketSeconds since (the least delayed packet's), relative to it: (seconds
+            // since, microseconds), and the bucket under way.
+            bool clockKnown = false;
+            uint32_t flowsEntered = 0; // (from the first time this machine enters the flow)
+            uint32_t firstOffset = 0;
+            Clock::time_point clockStart{};
+            int64_t clockBucket = -1, clockBucketMost = 0;
+            std::vector<std::pair<double, double>> clockPoints;
             Clock::time_point lastHello{};
             bool (*sampleLocal)(Pad&) = nullptr;
             // The other machine's clock (its newest time and when it arrived), and the round trip, smoothed.
@@ -435,12 +570,13 @@ namespace netplay::session
 
         bool g_configured = std::getenv(GAME_PREFIX "_NETPLAY") != nullptr;
 
-        // NETPLAY_ROLLBACK=1, in a session (read where it's first asked, which may be before this file's statics are).
+        // Whether a session's fights roll back: the default, unless NETPLAY_ROLLBACK=0 (session.h; read where it's first
+        // asked, which may be before this file's statics are).
         bool RollbackSetting()
         {
             static const bool rollback = [] {
                 const char* setting = std::getenv(GAME_PREFIX "_NETPLAY_ROLLBACK");
-                return std::getenv(GAME_PREFIX "_NETPLAY") != nullptr && setting && std::atoi(setting) != 0;
+                return std::getenv(GAME_PREFIX "_NETPLAY") != nullptr && !(setting && *setting && std::atoi(setting) == 0);
             }();
             return rollback;
         }
@@ -468,6 +604,18 @@ namespace netplay::session
             std::atomic<uint8_t> where{ uint8_t(Where::kOwnTime) };
         };
         Whereabouts& g_where = *new Whereabouts;
+
+        // What the alive thread's packets carry besides (the main thread writes it): the other machine's newest clock and
+        // when it came, for the echo (the round trip is measured from the handshake on), and this machine's pace.
+        struct AliveShared
+        {
+            std::mutex mutex;
+            bool peerTimeKnown = false;
+            uint32_t peerTime = 0;
+            std::chrono::steady_clock::time_point peerTimeArrival{};
+            Pace pace{};
+        };
+        AliveShared& g_alive = *new AliveShared;
 
         // DEBUG_NET_CONDITIONS=<latency ms>[,<jitter ms>[,<loss percent>[,<seed>]]]: a network's conditions for the
         // packets this machine sends (set on both machines, for both ways). Each packet is dropped with the loss's
@@ -783,6 +931,76 @@ namespace netplay::session
                 header.echo = std::max<uint32_t>(1, s.peerTime + uint32_t(MicrosecondsBetween(s.peerTimeArrival, now)));
         }
 
+        // The two clocks: the other machine's in a packet against this one's as it arrived, the largest offset each second
+        // (the least delayed packet's: the offset is the clocks' difference less the packet's way), relative to the first
+        // (DriftPpm).
+        void NoteClock(const Header& header, Clock::time_point arrival)
+        {
+            Session& s = g_session;
+            const uint32_t offset = header.time - Microseconds(arrival);
+            if (!s.clockKnown)
+            {
+                s.clockKnown = true;
+                s.firstOffset = offset;
+                s.clockStart = arrival;
+            }
+            const int64_t relative = int32_t(offset - s.firstOffset);
+            // Buckets of kClockBucketSeconds: even the alive packets' (4 a second) find a packet that took little longer
+            // than the least.
+            const int64_t bucket = std::chrono::duration_cast<std::chrono::seconds>(arrival - s.clockStart).count() / kClockBucketSeconds;
+            if (bucket != s.clockBucket)
+            {
+                if (s.clockBucket >= 0)
+                {
+                    s.clockPoints.emplace_back((double(s.clockBucket) + 0.5) * kClockBucketSeconds, double(s.clockBucketMost));
+                    // Two hours' at most: the oldest half goes.
+                    if (s.clockPoints.size() > 1440)
+                        s.clockPoints.erase(s.clockPoints.begin(), s.clockPoints.begin() + 720);
+                }
+                s.clockBucket = bucket;
+                s.clockBucketMost = relative;
+            }
+            else
+                s.clockBucketMost = std::max(s.clockBucketMost, relative);
+        }
+
+        // How much faster the other machine's clock runs than this one's, in parts per million, from the offsets of the
+        // least delayed packet of every kClockBucketSeconds (a line's slope through them), with the slope's standard error
+        // (`error`), over `seconds`; nothing before 30 s of them. On one PC (both instances share its clock), 0 within the
+        // error; two PCs' clocks differ by tens of ppm at most.
+        std::optional<double> DriftPpm(double& seconds, double& error)
+        {
+            const Session& s = g_session;
+            const std::vector<std::pair<double, double>>& points = s.clockPoints;
+            if (points.size() < size_t(30 / kClockBucketSeconds))
+                return std::nullopt;
+            double sumT = 0, sumO = 0;
+            for (const auto& [t, o] : points)
+            {
+                sumT += t;
+                sumO += o;
+            }
+            const double meanT = sumT / double(points.size()), meanO = sumO / double(points.size());
+            double covariance = 0, variance = 0;
+            for (const auto& [t, o] : points)
+            {
+                covariance += (t - meanT) * (o - meanO);
+                variance += (t - meanT) * (t - meanT);
+            }
+            if (variance <= 0)
+                return std::nullopt;
+            seconds = points.back().first - points.front().first;
+            const double slope = covariance / variance; // microseconds a second: ppm
+            double residuals = 0;
+            for (const auto& [t, o] : points)
+            {
+                const double residual = o - meanO - slope * (t - meanT);
+                residuals += residual * residual;
+            }
+            error = std::sqrt(residuals / double(std::max<size_t>(points.size() - 2, 1)) / variance);
+            return slope;
+        }
+
         // The other machine's clock in a packet from it, and the round trip of the echo of ours.
         void NoteTimes(const Header& header, Clock::time_point arrival)
         {
@@ -792,11 +1010,16 @@ namespace netplay::session
                 s.peerTime = header.time;
                 s.peerTimeArrival = arrival;
                 s.peerTimeKnown = true;
+                std::lock_guard lock(g_alive.mutex);
+                g_alive.peerTimeKnown = true;
+                g_alive.peerTime = s.peerTime;
+                g_alive.peerTimeArrival = arrival;
             }
+            NoteClock(header, arrival);
             if (header.echo == 0)
                 return;
             const uint32_t roundTrip = Microseconds(arrival) - header.echo;
-            if (roundTrip > 10'000'000)
+            if (roundTrip > kMaxRoundTripMicroseconds)
                 return;
             s.roundTripMicroseconds = s.roundTripMicroseconds == 0 ? roundTrip : s.roundTripMicroseconds * 0.9 + roundTrip * 0.1;
             Statistics& f = s.statistics;
@@ -804,6 +1027,44 @@ namespace netplay::session
             f.roundTripMicroseconds += roundTrip;
             f.shortestRoundTrip = std::min<uint64_t>(f.shortestRoundTrip, roundTrip);
             f.longestRoundTrip = std::max<uint64_t>(f.longestRoundTrip, roundTrip);
+            // For the input delays (Choose), and the menu screen's statistics.
+            s.roundTrips.push_back({ arrival, roundTrip });
+            if (s.roundTrips.size() > kRoundTripsKept)
+                s.roundTrips.pop_front();
+            s.roundTripCount++;
+            s.step.roundTrips++;
+            s.step.roundTripMicroseconds += roundTrip;
+        }
+
+        // The round trips of the last kRoundTripWindow (at least the last kLeastRoundTrips): how many, their mean and their
+        // 95th percentile (us).
+        struct RoundTrips
+        {
+            uint64_t count = 0;
+            double mean = 0, high = 0;
+        };
+        RoundTrips RecentRoundTrips()
+        {
+            const Session& s = g_session;
+            RoundTrips result;
+            if (s.roundTrips.empty())
+                return result;
+            const Clock::time_point since = s.roundTrips.back().arrival - kRoundTripWindow;
+            std::vector<uint32_t> values;
+            for (auto it = s.roundTrips.rbegin(); it != s.roundTrips.rend(); ++it)
+            {
+                if (it->arrival < since && values.size() >= kLeastRoundTrips)
+                    break;
+                values.push_back(it->microseconds);
+            }
+            double sum = 0;
+            for (const uint32_t value : values)
+                sum += value;
+            std::sort(values.begin(), values.end());
+            result.count = values.size();
+            result.mean = sum / double(values.size());
+            result.high = values[std::min(values.size() - 1, size_t(double(values.size()) * 0.95))];
+            return result;
         }
 
         // Sends a packet to the other machine (under the simulated conditions, if any). `counted`: in the statistics.
@@ -845,7 +1106,16 @@ namespace netplay::session
                 packet.header.version = kVersion;
                 packet.header.type = uint16_t(Type::kAlive);
                 packet.header.session = s.id;
-                packet.header.time = Microseconds(Clock::now());
+                const Clock::time_point now = Clock::now();
+                packet.header.time = Microseconds(now);
+                {
+                    // The echo of the other's clock (FillHeader's), so that the round trip is measured while no segment
+                    // runs (the handshake on), and this machine's pace.
+                    std::lock_guard lock(g_alive.mutex);
+                    if (g_alive.peerTimeKnown)
+                        packet.header.echo = std::max<uint32_t>(1, g_alive.peerTime + uint32_t(MicrosecondsBetween(g_alive.peerTimeArrival, now)));
+                    packet.pace = g_alive.pace;
+                }
                 packet.key = g_where.key.load();
                 packet.frame = g_where.frame.load();
                 packet.screen = g_where.screen.load();
@@ -1148,6 +1418,8 @@ namespace netplay::session
 
         // Ends the session as the two games went separate ways in the flow: logged, and in the window's title.
         void Apart(const std::string& why);
+        // The window title's status in a session (while it waits, how long since `waitStart`).
+        void UpdateStatus(bool waiting, Clock::time_point waitStart);
         // The other player's input for the current segment's frame `frame` came (the first time), in a fight that rolls
         // back: its slack, if this machine has run that frame already.
         void NoteArrival(uint32_t frame, Clock::time_point arrival);
@@ -1180,6 +1452,289 @@ namespace netplay::session
             return int32_t(std::clamp<int64_t>(sum / int64_t(s.slacks.size()), INT32_MIN + 1, INT32_MAX));
         }
 
+        // This machine's measures (Measures), the current fight's rollbacks counted in.
+        Measures LocalMeasures()
+        {
+            const Session& s = g_session;
+            const Rollback& rb = s.rb;
+            const auto bounded = [](double microseconds) {
+                return uint32_t(std::clamp(std::lround(microseconds), 1l, long(kMaxMeasureMicroseconds)));
+            };
+            Measures m{};
+            if (s.menuWorkFrames >= kWorkFramesMeasured)
+                m.menuWorkUs = bounded(s.menuWorkMicroseconds / double(s.menuWorkFrames));
+            if (s.fightWorkFrames >= kWorkFramesMeasured)
+                m.fightWorkUs = bounded(s.fightWorkMicroseconds / double(s.fightWorkFrames));
+            const uint64_t replayed = s.replayFrames + rb.laterFrames;
+            if (replayed)
+            {
+                m.replayFrameUs = bounded((s.replayMicroseconds + rb.laterMilliseconds * 1000.0) / double(replayed));
+                m.replayFrames = uint32_t(std::min<uint64_t>(replayed, UINT32_MAX));
+            }
+            if (const uint64_t loads = s.loads + rb.rollbacks)
+            {
+                m.loadUs = bounded((s.loadMicroseconds + rb.loadMicroseconds) / double(loads));
+                m.drawWaitUs = bounded((s.drawWaitMicroseconds + rb.drawWaitMicroseconds) / double(loads));
+            }
+            return m;
+        }
+
+        // Measures from the other machine, within what a machine measures.
+        Measures BoundedMeasures(const Measures& m)
+        {
+            Measures bounded = m;
+            bounded.menuWorkUs = std::min(m.menuWorkUs, kMaxMeasureMicroseconds);
+            bounded.fightWorkUs = std::min(m.fightWorkUs, kMaxMeasureMicroseconds);
+            bounded.replayFrameUs = std::min(m.replayFrameUs, kMaxMeasureMicroseconds);
+            bounded.loadUs = std::min(m.loadUs, kMaxMeasureMicroseconds);
+            bounded.drawWaitUs = std::min(m.drawWaitUs, kMaxMeasureMicroseconds);
+            return bounded;
+        }
+
+        // The frames a rollback can replay beside the present frame on a machine with these measures (FitsFor; ANALYSIS.md,
+        // Phase 6, The input delays a session chooses). A replayed frame's time as measured once kReplayFramesMeasured
+        // are, else a fight's frame's work (a replayed frame runs the same game work, its rendering discarded), else the
+        // menus' times kFightPerMenuWork, else kDefaultFits; the present frame's work as a fight's frame's, or the menus'
+        // times kFightPerMenuWork.
+        uint32_t Fits(const Measures& m, FitsFrom& from)
+        {
+            const Session& s = g_session;
+            const double fightWork = m.fightWorkUs ? double(m.fightWorkUs) : m.menuWorkUs * kFightPerMenuWork;
+            double replay = 0;
+            if (m.replayFrames >= kReplayFramesMeasured && m.replayFrameUs)
+            {
+                replay = m.replayFrameUs;
+                from = FitsFrom::kReplays;
+            }
+            else if (fightWork > 0)
+            {
+                replay = fightWork;
+                from = FitsFrom::kFrameWork;
+            }
+            else
+            {
+                from = FitsFrom::kDefault;
+                return std::min(kDefaultFits, s.window);
+            }
+            return FitsFor(replay, fightWork > 0 ? fightWork : replay, m.loadUs ? double(m.loadUs) : kDefaultLoadMicroseconds,
+                m.drawWaitUs ? double(m.drawWaitUs) : kDefaultDrawWaitMicroseconds, s.window);
+        }
+
+        // The frames after which an input sent at a frame boundary is on the other machine, a round trip and a frame's
+        // work given (ANALYSIS.md, Phase 6, Route 2 under network conditions): ceil((RTT / 2 + work) / frame).
+        uint32_t Late(double roundTripUs, double workUs)
+        {
+            return uint32_t(std::clamp(std::ceil((roundTripUs / 2 + workUs) / kFrameMicroseconds), 0.0, double(kMaxDelay)));
+        }
+
+        // The larger machine's frames' work, as the formulas reckon it (at least kLeastWorkMicroseconds, at most a frame).
+        double FramesWork(const Measures& local)
+        {
+            const Session& s = g_session;
+            double work = std::max<double>({ kLeastWorkMicroseconds, double(local.menuWorkUs), double(local.fightWorkUs) });
+            if (s.peerMeasuresKnown)
+                work = std::max<double>({ work, double(s.peerMeasures.menuWorkUs), double(s.peerMeasures.fightWorkUs) });
+            return std::min(work, kFrameMicroseconds);
+        }
+
+        // The host's choice of a segment's input delays (session.h), from the round trips of the last 10 s and both
+        // machines' measures: in lockstep (a menu screen, or a fight without rollback), the delay 60 frames a second needs at
+        // the mean round trip with a frame to spare, or at its 95th percentile if more (ANALYSIS.md, Phase 6, Route 2 under
+        // network conditions: the frames after which the other's input comes, less one, the GPU's queue holding a frame);
+        // in a fight that rolls back, the smallest that keeps a rollback (the frames after which the other's input comes,
+        // less the delay) within what the slower machine fits beside a frame (Fits), and at least kLeastFightDelay. The
+        // host's variables fix them; without a round trip measured, the defaults (3 and 2).
+        Delays Choose(uint32_t segment)
+        {
+            const Session& s = g_session;
+            Delays d;
+            d.segment = segment;
+            const RoundTrips trips = RecentRoundTrips();
+            const Measures local = LocalMeasures();
+            const double work = FramesWork(local);
+            d.roundTripUs = uint32_t(trips.mean);
+            d.roundTripHighUs = uint32_t(trips.high);
+            d.workUs = uint32_t(work);
+            if (s.lockstepFixed)
+            {
+                d.lockstep = uint8_t(s.delay);
+                d.lockstepHow = uint8_t(How::kFixed);
+            }
+            else if (!trips.count)
+            {
+                d.lockstep = 3;
+                d.lockstepHow = uint8_t(How::kDefault);
+            }
+            FitsFrom hostFrom = FitsFrom::kDefault, joiningFrom = FitsFrom::kDefault;
+            const Measures peer = s.peerMeasuresKnown ? s.peerMeasures : Measures{};
+            d.fitsHost = uint8_t(Fits(local, hostFrom));
+            d.fitsJoining = uint8_t(Fits(peer, joiningFrom));
+            d.fitsHostFrom = uint8_t(hostFrom);
+            d.fitsJoiningFrom = uint8_t(joiningFrom);
+            const DelayChoice choice = DelaysFor(trips.mean, trips.high, work, std::min(d.fitsHost, d.fitsJoining));
+            d.late = uint8_t(choice.late);
+            d.needed = uint8_t(choice.needed);
+            if (!s.lockstepFixed && trips.count)
+            {
+                d.lockstep = uint8_t(choice.lockstep);
+                d.lockstepHow = uint8_t(How::kChosen);
+            }
+            if (s.rollbackFixed)
+            {
+                d.rollback = uint8_t(s.fightDelay);
+                d.rollbackHow = uint8_t(How::kFixed);
+            }
+            else if (!trips.count)
+            {
+                d.rollback = uint8_t(kLeastFightDelay);
+                d.rollbackHow = uint8_t(How::kDefault);
+            }
+            else
+            {
+                d.rollback = uint8_t(choice.rollback);
+                d.rollbackHow = uint8_t(How::kChosen);
+            }
+            return d;
+        }
+
+        const char* FitsFromText(uint8_t from)
+        {
+            switch (FitsFrom(from))
+            {
+            case FitsFrom::kReplays:
+                return "its replayed frames";
+            case FitsFrom::kFrameWork:
+                return "its frames' work, no replay measured yet";
+            case FitsFrom::kDefault:
+                return "nothing measured yet";
+            default:
+                return "?";
+            }
+        }
+
+        // Why a segment plays with its delay, for the log (both machines: the joining one from the host's Delays).
+        std::string DelaysText(const Delays& d, bool rollbackFight)
+        {
+            char text[512];
+            const How how = How(rollbackFight ? d.rollbackHow : d.lockstepHow);
+            if (how == How::kFixed)
+                snprintf(text, sizeof(text), "fixed by the host's %s", rollbackFight ? GAME_PREFIX "_NETPLAY_FIGHT_DELAY" : GAME_PREFIX "_NETPLAY_DELAY");
+            else if (how == How::kDefault)
+                snprintf(text, sizeof(text), "the default: no round trip measured yet");
+            else if (!rollbackFight)
+                snprintf(text, sizeof(text), "chosen for a round trip of %.1f ms (95th percentile %.1f) and a frame's work of %.1f ms: 60 frames a "
+                    "second needs %u in lockstep, and one to spare%s", d.roundTripUs / 1000.0, d.roundTripHighUs / 1000.0, d.workUs / 1000.0,
+                    d.needed, d.lockstep > d.needed + 1 ? " (more for the 95th percentile)" : "");
+            else
+                snprintf(text, sizeof(text), "chosen for a round trip of %.1f ms and a frame's work of %.1f ms, at which the other player's "
+                    "input comes %u frames after the frame it's for; rollbacks of %u frames fit beside a frame on the host (from %s) and %u on "
+                    "the joining machine (from %s), so %u - %u, and at least %u", d.roundTripUs / 1000.0, d.workUs / 1000.0, d.late, d.fitsHost,
+                    FitsFromText(d.fitsHostFrom), d.fitsJoining, FitsFromText(d.fitsJoiningFrom), d.late, std::min(d.fitsHost, d.fitsJoining),
+                    std::min(kLeastFightDelay, std::max<uint32_t>(d.late, 1)));
+            return text;
+        }
+
+        // A machine's measures, for the log.
+        std::string MeasuresText(const Measures& m)
+        {
+            char text[256];
+            snprintf(text, sizeof(text), "a frame's work %.2f ms in the menus and %.2f ms in fights, a replayed frame %.2f ms (%u measured), a "
+                "load %.2f ms after a wait of %.2f ms for the GPU's draws", m.menuWorkUs / 1000.0, m.fightWorkUs / 1000.0, m.replayFrameUs / 1000.0,
+                m.replayFrames, m.loadUs / 1000.0, m.drawWaitUs / 1000.0);
+            return text;
+        }
+
+        // What the alive thread's packets carry: this machine's measures, and the host's latest choice.
+        void PublishPace()
+        {
+            Session& s = g_session;
+            Pace pace{};
+            pace.measures = LocalMeasures();
+            pace.delays = s.latestDelays;
+            std::lock_guard lock(g_alive.mutex);
+            g_alive.pace = pace;
+        }
+
+        // The host chooses a segment's delays (Choose): final once chosen, in its packets from then on.
+        void ChooseDelays(uint32_t segment)
+        {
+            Session& s = g_session;
+            if (!s.host || s.delays.count(segment))
+                return;
+            const Delays d = Choose(segment);
+            s.delays[segment] = d;
+            s.latestDelays = d;
+            while (s.delays.size() > 4)
+                s.delays.erase(s.delays.begin());
+            PublishPace();
+            LOG_INFO("Netplay: the input delays of the flow's segment %u: %u frames in lockstep (%s)%s%s", segment, d.lockstep,
+                DelaysText(d, false).c_str(), s.rollback ? ", and if it's a fight, " : "",
+                s.rollback ? (std::to_string(d.rollback) + " frames rolling back (" + DelaysText(d, true) + ")").c_str() : "");
+        }
+
+        // The host's choice of delays in its packet (the joining machine's view), within what a host chooses: kept the
+        // first time a segment's comes, for segments this machine hasn't played (choices are final).
+        void NoteDelays(const Delays& received)
+        {
+            Session& s = g_session;
+            if (s.host || received.segment == kNoKey || received.lockstepHow > uint8_t(How::kFixed) || received.rollbackHow > uint8_t(How::kFixed))
+                return;
+            // The segment this machine is in (its delay may still be unknown) or one after it.
+            const uint32_t first = s.segmentsStarted > 0 ? s.segmentsStarted - 1 : 0;
+            if (received.segment < first || received.segment >= s.segmentsStarted + uint32_t(kEarlyKept))
+                return;
+            Delays d = received;
+            d.lockstep = uint8_t(std::min<uint32_t>(d.lockstep, kMaxDelay));
+            d.rollback = uint8_t(std::min<uint32_t>(d.rollback, kMaxDelay));
+            d.needed = uint8_t(std::min<uint32_t>(d.needed, kMaxDelay));
+            d.late = uint8_t(std::min<uint32_t>(d.late, kMaxDelay));
+            d.fitsHost = uint8_t(std::min<uint32_t>(d.fitsHost, kMaxWindow));
+            d.fitsJoining = uint8_t(std::min<uint32_t>(d.fitsJoining, kMaxWindow));
+            d.fitsHostFrom = uint8_t(std::min<uint32_t>(d.fitsHostFrom, uint32_t(FitsFrom::kReplays)));
+            d.fitsJoiningFrom = uint8_t(std::min<uint32_t>(d.fitsJoiningFrom, uint32_t(FitsFrom::kReplays)));
+            d.roundTripUs = std::min(d.roundTripUs, kMaxRoundTripMicroseconds);
+            d.roundTripHighUs = std::min(d.roundTripHighUs, kMaxRoundTripMicroseconds);
+            d.workUs = std::min(d.workUs, kMaxMeasureMicroseconds);
+            const auto known = s.delays.find(d.segment);
+            if (known == s.delays.end())
+            {
+                s.delays[d.segment] = d;
+                while (!s.delays.empty() && s.delays.begin()->first < first)
+                    s.delays.erase(s.delays.begin());
+                while (s.delays.size() > kEarlyKept)
+                    s.delays.erase(std::prev(s.delays.end()));
+            }
+            else if ((known->second.lockstep != d.lockstep || known->second.rollback != d.rollback) && !s.delaysMismatchLogged)
+            {
+                s.delaysMismatchLogged = true;
+                LOG_WARN("Netplay: the host chose the flow's segment %u's delays again, otherwise (%u and %u frames, before %u and %u): the first "
+                         "choice stands (logged once)", d.segment, d.lockstep, d.rollback, known->second.lockstep, known->second.rollback);
+            }
+        }
+
+        // The pace in a packet from the other machine: its measures (the host chooses from them), and from the host, its
+        // choice of delays.
+        void NotePace(const Pace& pace)
+        {
+            Session& s = g_session;
+            s.peerMeasures = BoundedMeasures(pace.measures);
+            s.peerMeasuresKnown = true;
+            NoteDelays(pace.delays);
+        }
+
+        // This machine's player's frames in the flow: the main thread's work in the frame that ran before this boundary
+        // (netplay::LastFrameWork), a frame run as the present, not a replay's, a menu screen's or a fight's.
+        void NoteFrameWork(bool fight)
+        {
+            Session& s = g_session;
+            const FrameWork work = LastFrameWork();
+            if (!work.known || work.replayed)
+                return;
+            const double microseconds = double(std::min<uint64_t>(work.microseconds, kMaxMeasureMicroseconds));
+            (fight ? s.fightWorkMicroseconds : s.menuWorkMicroseconds) += microseconds;
+            (fight ? s.fightWorkFrames : s.menuWorkFrames)++;
+        }
+
         // A segment's inputs from frame `peerReceived` on (those the other player lacks; the segment's first `delay` frames
         // have none) and its last checksums, with the fight's setup here if `setup` isn't null, kSetupReceived if
         // `setupReceived`, and this player's settings for the flow if `settings` isn't null.
@@ -1197,6 +1752,9 @@ namespace netplay::session
             packet.received = received;
             packet.slack = slack;
             packet.setup = uint8_t((setup ? kSetupIncluded : 0) | (setupReceived ? kSetupReceived : 0));
+            packet.delay = uint8_t(delay);
+            packet.pace.measures = LocalMeasures();
+            packet.pace.delays = s.latestDelays;
             const GameState* game = GetGameState();
             if (settings && settings->known && game && game->playerSettings.size <= kSettingsSize)
             {
@@ -1389,6 +1947,7 @@ namespace netplay::session
             if (packet.pads > kMaxPads || packet.checksums > kChecksumsSent || packet.first >= kFrameWindow || packet.settingsSize > kSettingsSize ||
                 length < int(sizeof(SegmentPacket) + packet.pads * sizeof(Pad) + packet.checksums * sizeof(Checksum) + setupBytes))
                 return;
+            NotePace(packet.pace);
             Lockstep& step = s.step;
             const bool current = step.active && packet.key == step.key;
             // The same segment of the flow, but a fight on one machine and a menu screen on the other.
@@ -1437,6 +1996,22 @@ namespace netplay::session
             }
             if (current && step.fight && (packet.setup & kSetupReceived))
                 s.peerHasSetup = true;
+            // The input delay the other machine plays the segment with: the host's choice (Delays), the same on both, or
+            // their frames would go separate ways. The joining machine that hasn't heard of the choice yet takes it.
+            const uint32_t peerDelay = std::min<uint32_t>(packet.delay, kMaxDelay);
+            if (current && step.delayKnown && peerDelay != step.delay)
+            {
+                char why[192];
+                snprintf(why, sizeof(why), "the two machines play %s with different input delays (this one %u frames, the other %u)",
+                    Named(step.key, step.screen).c_str(), step.delay, peerDelay);
+                Apart(why);
+                return;
+            }
+            if (current && !step.delayKnown && !s.host)
+            {
+                step.peerDelayKnown = true;
+                step.peerDelay = peerDelay;
+            }
             // Inputs for a segment this machine isn't in yet (it may be loading it, or be on its own still) wait until it
             // starts.
             Early* early = nullptr;
@@ -1449,6 +2024,8 @@ namespace netplay::session
                 early->screen = packet.screen;
                 if (settings.known && !early->settings.known)
                     early->settings = settings;
+                early->delayKnown = true;
+                early->delay = peerDelay;
             }
             else
             {
@@ -1491,34 +2068,50 @@ namespace netplay::session
             }
         }
 
+        // The input delays, for the log: fixed, or chosen for each segment.
+        std::string DelayText()
+        {
+            const Session& s = g_session;
+            if (s.lockstepFixed)
+                return "input delay " + std::to_string(s.delay) + " frames";
+            return "input delays chosen for each segment from the round trip";
+        }
+
         // How fights play, for the log.
         std::string RollbackText()
         {
             const Session& s = g_session;
             if (!s.rollback)
                 return "; fights in lockstep";
-            char text[128];
-            snprintf(text, sizeof(text), "; fights roll back, with an input delay of %u frames and a window of %u", s.fightDelay, s.window);
+            char text[160];
+            if (s.rollbackFixed)
+                snprintf(text, sizeof(text), "; fights roll back, with an input delay of %u frames and a window of %u", s.fightDelay, s.window);
+            else
+                snprintf(text, sizeof(text), "; fights roll back, with an input delay chosen for each fight and a window of %u", s.window);
             return text;
         }
 
-        // The joining machine takes the host's input delay (it has played no segment's frame yet: WaitForConnection), and
-        // with rollback the host's for fights and its window.
-        void AdoptDelay(uint32_t delay, uint32_t fightDelay, uint32_t window)
+        // The joining machine takes the host's window, and learns whether the host's variables fix its input delays (it has
+        // played no segment's frame yet: WaitForConnection). Its own delays' variables don't apply: the host chooses each
+        // segment's (Delays).
+        void AdoptDelay(uint32_t delay, uint32_t fightDelay, uint32_t window, uint8_t fixed)
         {
             Session& s = g_session;
-            delay = std::min<uint32_t>(delay, kMaxDelay); // as NETPLAY_DELAY's
-            if (delay != s.delay)
-                LOG_INFO("Netplay: the host's input delay, %u frames, instead of this machine's %u", delay, s.delay);
-            s.delay = delay;
+            if ((s.lockstepFixed || (s.rollback && s.rollbackFixed)) && !s.ignoredDelaysLogged)
+            {
+                s.ignoredDelaysLogged = true;
+                LOG_INFO("Netplay: this machine's %s ignored: the host's input delays apply", s.rollbackFixed ? GAME_PREFIX "_NETPLAY_DELAY and "
+                    GAME_PREFIX "_NETPLAY_FIGHT_DELAY are" : GAME_PREFIX "_NETPLAY_DELAY is");
+            }
+            s.lockstepFixed = (fixed & kFixedLockstep) != 0;
+            s.rollbackFixed = (fixed & kFixedRollback) != 0;
+            s.delay = std::min<uint32_t>(delay, kMaxDelay);
+            s.fightDelay = std::min<uint32_t>(fightDelay, kMaxDelay);
             if (!s.rollback)
                 return;
-            fightDelay = std::min<uint32_t>(fightDelay, kMaxDelay);
             window = std::clamp<uint32_t>(window, 1, kMaxWindow);
-            if (fightDelay != s.fightDelay || window != s.window)
-                LOG_INFO("Netplay: the host's input delay in fights, %u frames, and window, %u frames, instead of this machine's %u and %u", fightDelay,
-                    window, s.fightDelay, s.window);
-            s.fightDelay = fightDelay;
+            if (window != s.window)
+                LOG_INFO("Netplay: the host's window in fights, %u frames, instead of this machine's %u", window, s.window);
             s.window = window;
         }
 
@@ -1576,8 +2169,8 @@ namespace netplay::session
                     s.peerName = Describe(from);
                     s.state = State::kConnected;
                     s.lastArrival = arrival;
-                    LOG_INFO("Netplay: player 2 at %s (%s); input delay %u frames, seed %u%s", s.peerName.c_str(),
-                        Text(hello.identity.machine, sizeof(hello.identity.machine)).c_str(), s.delay, s.seed, RollbackText().c_str());
+                    LOG_INFO("Netplay: player 2 at %s (%s); %s, seed %u%s", s.peerName.c_str(),
+                        Text(hello.identity.machine, sizeof(hello.identity.machine)).c_str(), DelayText().c_str(), s.seed, RollbackText().c_str());
                 }
                 else if (!known)
                     return;
@@ -1588,6 +2181,7 @@ namespace netplay::session
                 welcome.delay = uint16_t(s.delay);
                 welcome.fightDelay = uint16_t(s.fightDelay);
                 welcome.window = uint16_t(s.window);
+                welcome.fixed = uint8_t((s.lockstepFixed ? kFixedLockstep : 0) | (s.rollbackFixed ? kFixedRollback : 0));
                 welcome.identity = s.identity;
                 Send(&welcome, sizeof(welcome));
                 return;
@@ -1607,12 +2201,12 @@ namespace netplay::session
                 }
                 s.id = welcome.header.session;
                 s.seed = welcome.seed;
-                AdoptDelay(welcome.delay, welcome.fightDelay, welcome.window);
+                AdoptDelay(welcome.delay, welcome.fightDelay, welcome.window, welcome.fixed);
                 s.state = State::kConnected;
                 s.lastArrival = arrival;
                 NoteTimes(header, arrival);
-                LOG_INFO("Netplay: joined %s (%s) as player 2; input delay %u frames, seed %u%s", s.peerName.c_str(),
-                    Text(welcome.identity.machine, sizeof(welcome.identity.machine)).c_str(), s.delay, s.seed, RollbackText().c_str());
+                LOG_INFO("Netplay: joined %s (%s) as player 2; %s, seed %u%s", s.peerName.c_str(),
+                    Text(welcome.identity.machine, sizeof(welcome.identity.machine)).c_str(), DelayText().c_str(), s.seed, RollbackText().c_str());
                 return;
             }
             case Type::kRefuse:
@@ -1642,6 +2236,8 @@ namespace netplay::session
                 memcpy(&s.peerWhere, data, sizeof(Alive));
                 s.peerWhereKnown = true;
                 s.peerWhereArrival = arrival;
+                NoteTimes(header, arrival);
+                NotePace(s.peerWhere.pace);
                 return;
             case Type::kSegment:
                 NoteTimes(header, arrival);
@@ -1721,11 +2317,18 @@ namespace netplay::session
         {
             Session& s = g_session;
             const std::string setting = std::getenv(GAME_PREFIX "_NETPLAY");
-            if (const char* delay = std::getenv(GAME_PREFIX "_NETPLAY_DELAY"))
+            // The input delays: the host chooses each segment's unless its variables fix them (Choose).
+            if (const char* delay = std::getenv(GAME_PREFIX "_NETPLAY_DELAY"); delay && *delay)
+            {
                 s.delay = std::clamp<uint32_t>(uint32_t(strtoul(delay, nullptr, 10)), 0, kMaxDelay);
+                s.lockstepFixed = true;
+            }
             s.rollback = RollbackSetting();
-            if (const char* delay = std::getenv(GAME_PREFIX "_NETPLAY_FIGHT_DELAY"))
+            if (const char* delay = std::getenv(GAME_PREFIX "_NETPLAY_FIGHT_DELAY"); delay && *delay)
+            {
                 s.fightDelay = std::clamp<uint32_t>(uint32_t(strtoul(delay, nullptr, 10)), 0, kMaxDelay);
+                s.rollbackFixed = true;
+            }
             if (const char* window = std::getenv(GAME_PREFIX "_NETPLAY_WINDOW"))
                 s.window = std::clamp<uint32_t>(uint32_t(strtoul(window, nullptr, 10)), 1, kMaxWindow);
             s.state = State::kEnded;
@@ -1794,10 +2397,6 @@ namespace netplay::session
                 LOG_INFO("Netplay: joining %s as player 2%s", s.peerName.c_str(), RollbackText().c_str());
         }
 
-        // A fight that rolls back: the frames replayed that fit beside a frame on a fast PC (ANALYSIS.md, Phase 6: about 6 on
-        // a Ryzen 7 7800X3D), for the input delay the summary says a round trip needs.
-        constexpr int kFittingRollback = 6;
-
         // A fight's rollback statistics (Rollback), for the log.
         std::string RollbackSummary(double seconds)
         {
@@ -1838,6 +2437,23 @@ namespace netplay::session
             return result + text;
         }
 
+        // What a segment's statistics end with: both machines' measures, and the two clocks.
+        std::string PaceSummary()
+        {
+            const Session& s = g_session;
+            std::string text = "; this machine's measures: " + MeasuresText(LocalMeasures());
+            if (s.peerMeasuresKnown)
+                text += "; the other's: " + MeasuresText(s.peerMeasures);
+            double seconds = 0, error = 0;
+            if (const std::optional<double> ppm = DriftPpm(seconds, error))
+            {
+                char drift[128];
+                snprintf(drift, sizeof(drift), "; the other machine's clock %+.1f ppm (+-%.1f) against this one's (over %.0f s)", *ppm, error, seconds);
+                text += drift;
+            }
+            return text;
+        }
+
         // The fight's statistics, for the log.
         std::string Summary()
         {
@@ -1870,12 +2486,16 @@ namespace netplay::session
                 // that work (about 2 ms on a fast PC) fit in delay + 1 frames (ANALYSIS.md, Phase 6). With rollback the
                 // other's input comes that many frames, less the delay, after the frame that needed it ran on a
                 // prediction, and a rollback replays as many.
+                // (The frames' work and what fits as the host's choice reckons them: Choose.)
                 const double average = double(f.roundTripMicroseconds) / f.roundTrips;
-                const int late = int(std::ceil((average / 2 + 2000) / 16667.0));
+                const Measures local = LocalMeasures();
+                const int late = int(Late(average, FramesWork(local)));
+                FitsFrom from = FitsFrom::kDefault;
+                const int fits = int(std::min(Fits(local, from), Fits(s.peerMeasuresKnown ? s.peerMeasures : Measures{}, from)));
                 if (rollback)
                     snprintf(roundTrip, sizeof(roundTrip), "the round trip %.1f ms (%.1f-%.1f), for which rollbacks of at most %d frames need a "
                         "delay of %d frames or more; ", milliseconds(average), milliseconds(double(f.shortestRoundTrip)),
-                        milliseconds(double(f.longestRoundTrip)), kFittingRollback, std::max(0, late - kFittingRollback));
+                        milliseconds(double(f.longestRoundTrip)), fits, std::max(0, late - fits));
                 else
                     snprintf(roundTrip, sizeof(roundTrip), "the round trip %.1f ms (%.1f-%.1f), for which 60 frames a second needs a delay of %d "
                         "frames or more; ", milliseconds(average), milliseconds(double(f.shortestRoundTrip)),
@@ -1907,7 +2527,7 @@ namespace netplay::session
                 (unsigned long long)f.resent, (unsigned long long)f.dropped, (unsigned long long)f.packetsReceived,
                 f.packetsSent ? double(f.bytesSent) / double(f.packetsSent) : 0.0, rollback ? "; " : "",
                 rollback ? RollbackSummary(seconds).c_str() : "");
-            return text;
+            return text + PaceSummary();
         }
 
         // A segment of the flow starts (its first frame past loading): the other player's inputs and checksums (and
@@ -1925,12 +2545,21 @@ namespace netplay::session
             step.number = segment.number;
             step.fight = segment.fight;
             step.startFrame = frame;
-            step.delay = segment.fight && s.rollback ? s.fightDelay : s.delay;
+            // Its input delay, the host's choice, once connected (ResolveDelay).
+            step.delay = 0;
+            step.delayKnown = false;
             if (!s.flow)
             {
                 s.flow = true;
                 s.flowFirstKey = step.key;
                 s.flowEntered = frame;
+                // The two clocks from here, the boot's load left out (it slows the threads that send and receive).
+                if (s.flowsEntered++ == 0)
+                {
+                    s.clockKnown = false;
+                    s.clockBucket = -1;
+                    s.clockPoints.clear();
+                }
                 s.localSettings = LocalPlayerSettings();
                 s.remoteSettings = Settings{};
                 s.settingsApplied = false;
@@ -1945,6 +2574,11 @@ namespace netplay::session
                 step.remoteScreen = early->second.screen;
                 if (early->second.settings.known && !s.remoteSettings.known)
                     s.remoteSettings = early->second.settings;
+                if (early->second.delayKnown && !s.host)
+                {
+                    step.peerDelayKnown = true;
+                    step.peerDelay = early->second.delay;
+                }
                 s.early.erase(early);
             }
             // Packets of earlier segments won't be needed.
@@ -1974,6 +2608,105 @@ namespace netplay::session
                 LOG_ERROR("Netplay: fight %u starts before both players' settings were applied", s.fight);
             LOG_INFO("Netplay: fight %u: its first frame at game frame %llu", s.fight, (unsigned long long)frame);
             CompareSetups();
+        }
+
+        // The host, at the flow's first segment: a few round trips measured before it chooses the segment's delays (from
+        // the handshake on, the alive packets measure it; a host that waited for the other to join has just connected),
+        // at most kFirstRoundTripWait.
+        void WaitForRoundTrips()
+        {
+            Session& s = g_session;
+            const Clock::time_point start = Clock::now();
+            if (s.roundTripCount >= kFirstRoundTrips)
+                return;
+            SetWhere(Where::kWaiting);
+            while (s.roundTripCount < kFirstRoundTrips && s.state == State::kConnected && Clock::now() - start < kFirstRoundTripWait)
+            {
+                WaitForPackets();
+                CheckSilence(Clock::now());
+                UpdateStatus(false, start);
+            }
+            SetWhere(Where::kInSegment);
+            LOG_INFO("Netplay: %s: %llu round trips measured, after %.1f s, for its input delays", Named(s.step.key, s.step.screen).c_str(),
+                (unsigned long long)s.roundTripCount, SecondsBetween(start, Clock::now()));
+        }
+
+        // The joining machine at a segment's first frame, before it knows the host's choice of its delays (the host chooses
+        // them as it ends the segment before, and its packets carry them): waits for them. The host's packets of the
+        // segment say its delay too. As long as for the other's input at most (WaitForInput). False if the session ended.
+        bool WaitForDelays()
+        {
+            Session& s = g_session;
+            Lockstep& step = s.step;
+            const Clock::time_point start = Clock::now();
+            Clock::time_point nextNotice = start + kWaitNotice, stuckSince = start;
+            SetWhere(Where::kWaiting);
+            while (!s.delays.count(step.ordinal) && !step.peerDelayKnown && s.state == State::kConnected)
+            {
+                WaitForPackets();
+                const Clock::time_point now = Clock::now();
+                CheckSilence(now);
+                UpdateStatus(true, start);
+                if (now >= nextNotice)
+                {
+                    nextNotice = now + kNoticeInterval;
+                    LOG_INFO("Netplay: %s, frame 0: waiting %.0f s for the host's input delays for it; %s", Named(step.key, step.screen).c_str(),
+                        SecondsBetween(start, now), PeerWhere().c_str());
+                }
+                // While the other machine's game loads, or its player plays on their own, it's on its way.
+                const bool fresh = s.peerWhereKnown && now - s.peerWhereArrival < kAliveInterval * 4;
+                if (fresh && (Where(s.peerWhere.where) == Where::kOwnTime || Where(s.peerWhere.where) == Where::kBetween))
+                    stuckSince = now;
+                if (now - stuckSince >= kWaitLimit)
+                    End("the host's input delays didn't come");
+            }
+            SetWhere(Where::kInSegment);
+            if (const double waited = SecondsBetween(start, Clock::now()); s.state == State::kConnected && waited >= 0.1)
+                LOG_INFO("Netplay: %s, frame 0: the host's input delays came after %.1f s", Named(step.key, step.screen).c_str(), waited);
+            return s.state == State::kConnected;
+        }
+
+        // A segment's input delay, once connected: the host's choice (ChooseDelays: the host chooses the first segment's
+        // now, a few round trips measured), which the joining machine may have to wait for; logged with why. False if the
+        // session ended meanwhile.
+        bool ResolveDelay()
+        {
+            Session& s = g_session;
+            Lockstep& step = s.step;
+            if (step.delayKnown)
+                return true;
+            if (s.host && !s.delays.count(step.ordinal))
+            {
+                WaitForRoundTrips();
+                if (s.state != State::kConnected)
+                    return false;
+                ChooseDelays(step.ordinal);
+            }
+            if (!s.host && !s.delays.count(step.ordinal) && !step.peerDelayKnown && !WaitForDelays())
+                return false;
+            const bool rollbackFight = step.fight && s.rollback;
+            const auto chosen = s.delays.find(step.ordinal);
+            std::string why;
+            if (chosen != s.delays.end())
+            {
+                step.delay = rollbackFight ? chosen->second.rollback : chosen->second.lockstep;
+                why = DelaysText(chosen->second, rollbackFight);
+                if (!s.host)
+                    why = "the host's choice: " + why;
+            }
+            else
+            {
+                step.delay = step.peerDelay;
+                why = "the host's, as its packets of it say";
+            }
+            step.delay = std::min(step.delay, kMaxDelay);
+            step.delayKnown = true;
+            if (step.fight)
+                LOG_INFO("Netplay: fight %u (%s): input delay %u frames%s, %s", s.fight, Named(step.key, step.screen).c_str(), step.delay,
+                    rollbackFight ? ", rolling back" : ", in lockstep", why.c_str());
+            else
+                LOG_INFO("Netplay: %s: input delay %u frames, %s", Named(step.key, step.screen).c_str(), step.delay, why.c_str());
+            return true;
         }
 
         // Both players' settings for the flow, once both are known (at the flow's first frame that needs the other's
@@ -2089,13 +2822,40 @@ namespace netplay::session
             {
                 StopRollback(frame);
                 LOG_INFO("Netplay: fight %u ended at its frame %u: %s", s.fight, s.lastFightFrame, Summary().c_str());
+                // Its rollbacks' measures join the session's (Measures).
+                Rollback& rb = s.rb;
+                s.replayMicroseconds += rb.laterMilliseconds * 1000.0;
+                s.replayFrames += rb.laterFrames;
+                s.loadMicroseconds += rb.loadMicroseconds;
+                s.drawWaitMicroseconds += rb.drawWaitMicroseconds;
+                s.loads += rb.rollbacks;
+                rb = Rollback{};
             }
             else
-                LOG_INFO("Netplay: %s ended at its frame %u (game frame %llu): %.1f ms waited at frame %u for the other player, then %llu "
-                         "waits for its input (%.1f ms at most, %.1f ms in all); %llu checksums compared, %s", Named(step.key, step.screen).c_str(),
-                    step.lastFrame, (unsigned long long)frame - 1, step.startWaitMicroseconds / 1000.0, step.delay, (unsigned long long)step.waits,
-                    step.longestWaitMicroseconds / 1000.0, step.waitedMicroseconds / 1000.0, (unsigned long long)step.compared,
-                    step.differs || step.apart ? "the menus differed" : "the same");
+            {
+                // Its frame rate from its frame `delay` on, as a fight's.
+                char rate[192] = "";
+                if (step.settled != Clock::time_point{} && step.lastFrame > step.delay)
+                {
+                    const uint32_t frames = step.lastFrame - step.delay;
+                    const double seconds = std::chrono::duration<double>(step.lastBoundary - step.settled).count();
+                    const uint64_t vblanks = gpu::GetStatistics().vblanks.load() - step.vblanks, swaps = gpu::GetStatistics().swaps.load() - step.swaps;
+                    snprintf(rate, sizeof(rate), "%u frames in %.2f s from its frame %u (%.2f a second), %llu of %llu vblanks without a new frame; ",
+                        frames, seconds, step.delay, seconds > 0 ? frames / seconds : 0.0, (unsigned long long)(vblanks > swaps ? vblanks - swaps : 0),
+                        (unsigned long long)vblanks);
+                }
+                char roundTrip[64] = "";
+                if (step.roundTrips)
+                    snprintf(roundTrip, sizeof(roundTrip), "the round trip %.1f ms; ", double(step.roundTripMicroseconds) / double(step.roundTrips) / 1000.0);
+                LOG_INFO("Netplay: %s ended at its frame %u (game frame %llu): %s%.1f ms waited at frame %u for the other player, then %llu "
+                         "waits for its input (%.1f ms at most, %.1f ms in all); %s%llu checksums compared, %s%s", Named(step.key, step.screen).c_str(),
+                    step.lastFrame, (unsigned long long)frame - 1, rate, step.startWaitMicroseconds / 1000.0, step.delay, (unsigned long long)step.waits,
+                    step.longestWaitMicroseconds / 1000.0, step.waitedMicroseconds / 1000.0, roundTrip, (unsigned long long)step.compared,
+                    step.differs || step.apart ? "the menus differed" : "the same", PaceSummary().c_str());
+            }
+            // The host chooses the next segment's delays now: the joining machine hears of them while both load it.
+            if (s.host && step.delayKnown && s.state == State::kConnected)
+                ChooseDelays(step.ordinal + 1);
             EndedSegment ended;
             ended.key = step.key;
             ended.screen = step.screen;
@@ -2525,7 +3285,7 @@ namespace netplay::session
                 StartSegment(segment, frame);
             if (s.state == State::kConnecting)
                 WaitForConnection(segment, frame);
-            if (s.state == State::kEnded)
+            if (s.state == State::kEnded || !ResolveDelay())
             {
                 Alone(segment);
                 return;
@@ -2537,7 +3297,11 @@ namespace netplay::session
             SetWhere(Where::kInSegment);
             if (step.fight)
                 NotePresentFrame(f, boundary);
+            // The frame before this one, the segment's too: its work (the input delays' measures).
+            if (f >= 1 && step.lastFrame == f - 1)
+                NoteFrameWork(step.fight);
             step.lastFrame = f;
+            step.lastBoundary = boundary;
             Pad local{};
             if (s.sampleLocal)
                 s.sampleLocal(local);
@@ -2599,10 +3363,17 @@ namespace netplay::session
                     stats.swaps = gpu::GetStatistics().swaps.load();
                     stats.discarded = gpu::GetDiscardStatistics().frames;
                 }
-                else if (game && game->seedMenus && BoundaryContext())
+                else
                 {
-                    // Both machines are here now, connected: the menus' random numbers from the session, the same on both.
-                    game->seedMenus(*BoundaryContext(), guest::g_base, (uint64_t(s.seed) << 32) ^ (uint64_t(step.key) * 0x9E3779B97F4A7C15ull));
+                    // The menu screen's frame rate from here (EndSegment).
+                    step.settled = Clock::now();
+                    step.vblanks = gpu::GetStatistics().vblanks.load();
+                    step.swaps = gpu::GetStatistics().swaps.load();
+                    if (game && game->seedMenus && BoundaryContext())
+                    {
+                        // Both machines are here now, connected: the menus' random numbers from the session, the same on both.
+                        game->seedMenus(*BoundaryContext(), guest::g_base, (uint64_t(s.seed) << 32) ^ (uint64_t(step.key) * 0x9E3779B97F4A7C15ull));
+                    }
                 }
             }
             const auto remote = step.remote.find(f);
@@ -2747,13 +3518,18 @@ namespace netplay::session
             rb.drawWaitMicroseconds += loaded.drawWaitUs;
             rb.longestDrawWaitMicroseconds = std::max(rb.longestDrawWaitMicroseconds, loaded.drawWaitUs);
             if (rb.replaying)
+            {
                 rb.nested++;
+                rb.replayClean = false;
+            }
             else
             {
                 replay::Begin();
                 rb.replaying = true;
                 rb.firstReplayed = false;
                 rb.replayEnd = frame;
+                rb.replayRunFrames = 1; // (the frame about to run)
+                rb.replayClean = true;
                 rb.replayStart = Clock::now();
             }
             return true;
@@ -2884,6 +3660,8 @@ namespace netplay::session
                 rb.reached.erase(rb.reached.begin());
             g_where.frame.store(f);
             SetWhere(Where::kInSegment);
+            // The present frame before this one: its work (the input delays' measures).
+            NoteFrameWork(true);
             step.lastFrame = f;
             Pad local{};
             if (s.sampleLocal)
@@ -2906,14 +3684,18 @@ namespace netplay::session
             if (rb.replaying && !rb.firstReplayed)
             {
                 rb.firstReplayed = true;
-                rb.firstFrameMilliseconds += std::chrono::duration<double, std::milli>(Clock::now() - rb.replayStart).count();
+                rb.replayFirstMilliseconds = std::chrono::duration<double, std::milli>(Clock::now() - rb.replayStart).count();
+                rb.firstFrameMilliseconds += rb.replayFirstMilliseconds;
             }
             if (rb.replaying && frame < rb.replayEnd)
             {
+                rb.replayRunFrames++;
                 // A replayed frame. In the fight's menus it runs with the other's input as it came, and after frames that
                 // did: should the inputs show a frame of this replay wrong, the replay goes back further.
                 if (InFightMenu())
                 {
+                    if (!step.remote.count(f))
+                        rb.replayClean = false;
                     if (!step.remote.count(f) && !WaitInFight(f, false))
                     {
                         StopRollback(frame);
@@ -2944,7 +3726,14 @@ namespace netplay::session
                 replay::End();
                 journal::FinishReplay();
                 rb.replaying = false;
-                rb.replayMilliseconds += std::chrono::duration<double, std::milli>(Clock::now() - rb.replayStart).count();
+                const double replayMs = std::chrono::duration<double, std::milli>(Clock::now() - rb.replayStart).count();
+                rb.replayMilliseconds += replayMs;
+                // Its frames after the first, back to back: a replayed frame's time (Measures).
+                if (rb.replayClean && rb.replayRunFrames > 1 && replayMs > rb.replayFirstMilliseconds)
+                {
+                    rb.laterMilliseconds += replayMs - rb.replayFirstMilliseconds;
+                    rb.laterFrames += rb.replayRunFrames - 1;
+                }
                 replayed = true;
             }
             for (;;)
@@ -3005,6 +3794,35 @@ namespace netplay::session
         }
     }
 
+    DelayChoice DelaysFor(double roundTripUs, double roundTripHighUs, double workUs, uint32_t fits)
+    {
+        DelayChoice choice;
+        choice.late = Late(roundTripUs, workUs);
+        choice.needed = std::max<uint32_t>(choice.late, 1) - 1;
+        const uint32_t high = std::max<uint32_t>(Late(roundTripHighUs, workUs), 1) - 1;
+        choice.lockstep = std::min(std::max(choice.needed + 1, high), kMaxDelay);
+        // At least kLeastFightDelay, or as many frames as the other's input takes if fewer (at such a round trip no rollback
+        // is needed: 1 on a local network, where 2 played the same but a frame later).
+        const uint32_t least = std::min(kLeastFightDelay, std::max<uint32_t>(choice.late, 1));
+        choice.rollback = std::min(std::max(least, choice.late > fits ? choice.late - fits : 0u), kMaxDelay);
+        return choice;
+    }
+
+    uint32_t FitsFor(double replayFrameUs, double presentWorkUs, double loadUs, double drawWaitUs, uint32_t window)
+    {
+        // The load (after its wait for the command processor's draws) and the first replayed frame take the time the
+        // present frame would have waited for its vblank, which that first frame then waits out (D3D lets the CPU run a
+        // frame ahead); if they don't fit in a frame, nothing does.
+        const double replay = std::max(replayFrameUs, 100.0);
+        if (drawWaitUs + loadUs + replay > kFrameMicroseconds)
+            return 0;
+        // The others, and the present frame, in the frame after, leaving the GPU its time to draw the present frame.
+        const double rest = kFrameMicroseconds - kDrawMarginMicroseconds - presentWorkUs;
+        if (rest < 0)
+            return 0;
+        return uint32_t(std::clamp(1 + std::floor(rest / replay), 0.0, double(window)));
+    }
+
     bool Configured()
     {
         return g_configured;
@@ -3061,7 +3879,10 @@ namespace netplay::session
         if (s.flow && !flow)
             LeaveFlow(frame);
         if (s.state == State::kConnected)
+        {
             CheckSilence(Clock::now());
+            PublishPace(); // (the alive packets' measures)
+        }
         if (s.state == State::kEnded)
         {
             if (s.step.active)

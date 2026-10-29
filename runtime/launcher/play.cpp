@@ -244,9 +244,9 @@ namespace launcher
         }
         if (!netplay.empty())
         {
+            // Lockstep's 0 too: rollback is the game's default.
             entries.push_back(netplayName + L"=" + FromUtf8(netplay));
-            if (choices.rollback)
-                entries.push_back(rollbackName + L"=1");
+            entries.push_back(rollbackName + (choices.rollback ? L"=1" : L"=0"));
         }
         std::wstring environment = EnvironmentBlock(entries);
 

@@ -46,6 +46,9 @@ namespace gpu
     // progress (advances the ring's read pointer, writes memory, delivers an interrupt) since the calling thread's
     // last call, or for a millisecond at most.
     void WaitForProgress();
+    // The calling thread's time blocked in WaitForProgress, in all (microseconds): netplay measures the main thread's work
+    // a frame without its waits for the GPU (netplay/frame.h).
+    uint64_t ThreadWaitedMicroseconds();
 
     // Frames whose rendering is discarded (netplay's replays, netplay/replay.h): the frames the guest records from
     // BeginDiscard until EndDiscard, counted by their swaps (VdSwap: NoteSwapRecorded), from the first swap recorded after

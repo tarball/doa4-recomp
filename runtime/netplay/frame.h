@@ -41,6 +41,16 @@ namespace netplay
         uint64_t boundaries = 0, microseconds = 0, longest = 0;
     };
     ThreadWaits GameThreadWaits();
+    // The main thread's work in the frame that ran before this boundary: the time from the last boundary's end to this
+    // one's start, but for its waits for the GPU (gpu::ThreadWaitedMicroseconds), which pace it to the vblanks. What a
+    // frame costs when it doesn't wait, as a replayed one runs (a session chooses its input delays from it: session.h).
+    // `replayed`: the frame was a replay's (netplay/replay.h). `known` is false at the first boundary.
+    struct FrameWork
+    {
+        bool known = false, replayed = false;
+        uint64_t microseconds = 0;
+    };
+    FrameWork LastFrameWork();
     // The current frame's number in the current fight, counted from the fight's first frame past its loading (0), which
     // netplay counts input by, or nothing outside a fight (the game says when it's in one: GameState::fightState).
     std::optional<uint64_t> FightFrame();
