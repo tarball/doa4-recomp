@@ -82,12 +82,14 @@ namespace gpu::shader
     // reads back). Pixel shaders also output magenta for non-finite colors; DEBUG_NAN=2 also paints pixels with
     // non-finite interpolators green.
     uint32_t DebugNan();
-    // The counts buffer: kDebugCountSlots slots of 8 dwords, the slot chosen by the shader's hash: hash (low, high),
+    // The counts buffer: kDebugCountSlots slots of 16 dwords, the slot chosen by the shader's hash: hash (low, high),
     // flags (bit 0: a pixel shader, and the kDebugNonFinite bits seen), invocations with such a product, with non-finite
-    // outputs, 0xFFFF minus the lowest address of an ALU instruction with such a product, the highest, and invocations
-    // with non-finite inputs.
+    // outputs, 0xFFFF minus the lowest address of an ALU instruction with such a product, the highest, invocations with
+    // non-finite inputs, and the interpolator components seen non-finite (a vertex shader's outputs, a pixel shader's
+    // inputs: 4 bits an interpolator, x lowest, in two dwords).
     inline constexpr uint32_t kDebugCountSlots = 4096;
-    inline constexpr uint32_t kDebugCountBytes = kDebugCountSlots * 32;
+    inline constexpr uint32_t kDebugSlotDwords = 16;
+    inline constexpr uint32_t kDebugCountBytes = kDebugCountSlots * kDebugSlotDwords * 4;
     inline constexpr uint32_t kDebugNonFiniteVertexData = 1u << 1;
     inline constexpr uint32_t kDebugNonFiniteInterpolators = 1u << 2; // pixel shader inputs
     inline constexpr uint32_t kDebugNonFiniteTexels = 1u << 3;

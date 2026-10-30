@@ -1,8 +1,6 @@
 // Getting ready to play and starting the game (launcher.h).
-#include "launcher/build.h"
 #include "launcher/launcher.h"
 
-#include <cstdlib>
 #include <cwctype>
 
 #include <winsock2.h>
@@ -53,35 +51,28 @@ namespace launcher
         }
     }
 
-    double CancelAfterSeconds()
-    {
-        const char* setting = std::getenv(GAME_PREFIX "_DEBUG_LAUNCHER_CANCEL");
-        return setting ? std::atof(setting) : 0.0;
-    }
-
-    Readiness Prepare(const Folder& folder, const std::wstring& chosen, Build& build, const Reporter& report, std::wstring& message, Disc& disc)
+    Readiness Prepare(const Folder& folder, const std::wstring& chosen, const Reporter& report, std::wstring& message, Disc& disc)
     {
         message.clear();
         disc = {};
-        const auto show = [&](Report::Phase phase, const std::wstring& text) {
+        const auto show = [&](const std::wstring& text) {
             if (report)
-                report({ phase, 0, text });
+                report(text);
         };
-        show(Report::Phase::kChecking, L"Checking the game's files...");
+        show(L"Checking the game's files...");
         if (const std::wstring missing = MissingFile(folder); !missing.empty())
         {
-            message = L"This release isn't complete: " + missing + L" is missing from " + folder.root +
-                L".\n\nExtract the whole zip again, to a folder of its own.";
+            message = missing + L" is missing from " + folder.root + L".\n\nExtract the release's zip again, to a folder of its own.";
             return Readiness::kFailed;
         }
         if (!HasAvx())
         {
-            message = L"This PC's processor doesn't have AVX, which the game needs: processors from 2011 on have it.";
+            message = L"The game needs a processor with AVX (most from 2011 on), which this PC's doesn't have.";
             return Readiness::kFailed;
         }
 
         // The disc image: the one chosen, else the one remembered, else one next to the launcher or in the data folder.
-        show(Report::Phase::kChecking, L"Checking your disc image...");
+        show(L"Checking your disc image...");
         std::vector<std::wstring> candidates;
         const std::wstring remembered = RememberedDisc(folder);
         if (!chosen.empty())
@@ -123,52 +114,13 @@ namespace launcher
                 return Readiness::kFailed;
             }
         }
-
-        // The game's code: the release's, or built now.
-        if (folder.development)
-        {
-            if (IsFile(folder.Module()))
-                return Readiness::kReady;
-            message = L"There's no " GAME_EXECUTABLE "_ppc.dll beside " GAME_EXECUTABLE ".exe in " + folder.root +
-                L", and this isn't a release's folder (it has no recomp folder), so it can't be built here: build it with build.cmd.";
-            return Readiness::kFailed;
-        }
-        const std::string expected = ExpectedModuleHash(folder);
-        if (expected.empty())
-        {
-            message = L"This release isn't complete: " + folder.ExpectedHashFile() + L" isn't right.\n\nExtract the whole zip again, to a folder of its own.";
-            return Readiness::kFailed;
-        }
-        // Another launcher in this folder holds the lock while it checks the module (a moment) or builds it.
-        BuildLock lock;
-        for (int waits = 0;; waits++)
-        {
-            unsigned long error = 0;
-            if (lock.TryAcquire(folder, error))
-                break;
-            if (error)
-            {
-                message = L"Can't write " + folder.Recomp() + L": " + SystemMessage(error) +
-                    L"\n\nPut the game in a folder you can change, such as one in Documents (not Program Files).";
-                return Readiness::kFailed;
-            }
-            if (waits == 4)
-                show(Report::Phase::kWaiting, L"Another launcher is building the game's code in this folder: this one waits for it.");
-            if (build.Cancelled())
-                return Readiness::kCancelled;
-            Sleep(250);
-        }
-        RemoveLeftovers(folder);
-        show(Report::Phase::kChecking, L"Checking the game's code...");
-        if (FileSha256(folder.Module()) == expected)
-            return Readiness::kReady;
-        return build.Run(folder, disc, report, message);
+        return Readiness::kReady;
     }
 
     std::string NetplaySetting(const Choices& choices, std::wstring& problem)
     {
         problem.clear();
-        if (!choices.netplay)
+        if (!GAME_NETPLAY || !choices.netplay)
             return {};
         if (choices.host)
         {
@@ -253,7 +205,7 @@ namespace launcher
         const std::wstring executable = folder.Executable();
         std::wstring commandLine = Quote(executable) + L" " + Quote(FromNarrow(data));
         // No standard handles: the game logs to <data>\<executable>.log. It gets Windows' default error mode, not the
-        // launcher's (which keeps the tools' crashes from showing dialogs).
+        // launcher's (which keeps critical errors' dialogs away).
         STARTUPINFOW startup{};
         startup.cb = sizeof(startup);
         startup.dwFlags = STARTF_USESTDHANDLES;

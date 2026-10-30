@@ -251,7 +251,10 @@ namespace kernel
                 if (thread->waitKind.load(std::memory_order_relaxed) == GuestThread::WaitKind::kNone)
                 {
                     described = true;
-                    thread->waitObject.store(headers.empty() ? 0 : headers[0], std::memory_order_relaxed);
+                    if (headers.empty())
+                        thread->waitObjects[0].store(0, std::memory_order_relaxed);
+                    for (size_t i = 0; i < std::min(headers.size(), GuestThread::kWaitObjects); i++)
+                        thread->waitObjects[i].store(headers[i], std::memory_order_relaxed);
                     thread->waitCount.store(uint32_t(headers.size()), std::memory_order_relaxed);
                     thread->waitKind.store(waitAll ? GuestThread::WaitKind::kAll : GuestThread::WaitKind::kAny, std::memory_order_release);
                 }

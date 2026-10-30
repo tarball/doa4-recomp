@@ -1,6 +1,8 @@
 // The kernel's C runtime formatting exports (sprintf, _vsnprintf, vsprintf, vswprintf), formatting
 // guest arguments. Variadic arguments occupy 8-byte slots: r3..r10, then the caller's stack from
 // r1 + 0x50; a va_list points at such slots. Doubles are passed as bit patterns in those slots.
+// vswprintf formats in the narrow formatter with each UTF-16 unit outside ASCII carried as three bytes (as UTF-8
+// encodes it), decoded back at the end, so text like DOAX2's money (its own currency sign) comes through.
 #include "guest_abi.h"
 #include "log.h"
 
@@ -38,13 +40,43 @@ namespace
         uint32_t m_vaList = 0;
     };
 
-    std::string Narrow(const be<uint16_t>* text, int maxLength = -1)
+    // A UTF-16 unit for the formatter: ASCII as is; others as three bytes (`wide`, for vswprintf's output) or '?'.
+    void AppendUnit(std::string& out, uint16_t c, bool wide)
+    {
+        if (c < 0x80)
+            out.push_back(char(c));
+        else if (!wide)
+            out.push_back('?');
+        else
+        {
+            out.push_back(char(0xE0 | (c >> 12)));
+            out.push_back(char(0x80 | ((c >> 6) & 0x3F)));
+            out.push_back(char(0x80 | (c & 0x3F)));
+        }
+    }
+
+    std::string Narrow(const be<uint16_t>* text, int maxLength = -1, bool wide = false)
     {
         std::string result;
         for (int i = 0; text && text[i] != 0 && (maxLength < 0 || i < maxLength); i++)
+            AppendUnit(result, text[i], wide);
+        return result;
+    }
+
+    // The formatter's output for vswprintf, back to UTF-16 units.
+    std::u16string Widen(const std::string& text)
+    {
+        std::u16string result;
+        for (size_t i = 0; i < text.size(); i++)
         {
-            const uint16_t c = text[i];
-            result.push_back(c < 0x80 ? char(c) : '?');
+            const uint8_t c = uint8_t(text[i]);
+            if ((c & 0xF0) == 0xE0 && i + 2 < text.size())
+            {
+                result.push_back(char16_t(((c & 0x0F) << 12) | ((uint8_t(text[i + 1]) & 0x3F) << 6) | (uint8_t(text[i + 2]) & 0x3F)));
+                i += 2;
+            }
+            else
+                result.push_back(char16_t(c));
         }
         return result;
     }
@@ -142,8 +174,15 @@ namespace
                 break;
             case 'c':
             case 'C':
-                out.push_back(char(args.Next()));
+            {
+                // %C flips the width relative to the format's own, as %S does.
+                const uint64_t value = args.Next();
+                if (type == 'C' ? !wideFormat : (narrow ? false : wide))
+                    AppendUnit(out, uint16_t(value), wideFormat);
+                else
+                    AppendUnit(out, uint8_t(value), wideFormat);
                 break;
+            }
             case 'f':
             case 'F':
             case 'e':
@@ -168,10 +207,16 @@ namespace
                 if (!address)
                     text = "(null)";
                 else if (wideString)
-                    text = Narrow(guest::Translate<be<uint16_t>>(address), precision);
+                    text = Narrow(guest::Translate<be<uint16_t>>(address), precision, wideFormat);
                 else
-                    text = precision >= 0 ? std::string(guest::Translate<char>(address), strnlen(guest::Translate<char>(address), size_t(precision)))
-                                          : std::string(guest::Translate<char>(address));
+                {
+                    const char* chars = guest::Translate<char>(address);
+                    const size_t length = precision >= 0 ? strnlen(chars, size_t(precision)) : strlen(chars);
+                    for (size_t k = 0; k < length; k++)
+                        AppendUnit(text, uint8_t(chars[k]), wideFormat);
+                    if (!wideFormat)
+                        text.assign(chars, length); // (a narrow string into narrow output: bytes as they are)
+                }
                 snprintf(buffer, sizeof(buffer), (spec.substr(0, spec.find('.')) + "s").c_str(), text.c_str());
                 out += buffer;
                 break;
@@ -225,11 +270,11 @@ namespace
     int32_t vswprintf_(be<uint16_t>* buffer, const be<uint16_t>* format, uint32_t vaList)
     {
         Arguments args(vaList);
-        const std::string text = Format(Narrow(format), args, true);
+        const std::u16string text = Widen(Format(Narrow(format, -1, true), args, true));
         if (buffer)
         {
             for (size_t i = 0; i < text.size(); i++)
-                buffer[i] = uint16_t(uint8_t(text[i]));
+                buffer[i] = uint16_t(text[i]);
             buffer[text.size()] = 0;
         }
         return int32_t(text.size());

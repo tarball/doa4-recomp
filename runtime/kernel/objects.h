@@ -83,6 +83,9 @@ namespace kernel
 
     // Objects referenced by guest pointer (ObReferenceObjectByHandle hands out their GuestObject()).
     void RegisterGuestObject(const std::shared_ptr<KernelObject>& object);
+    // Takes a reference to a handle's object, as ObReferenceObjectByHandle does (ObDereferenceObject releases it).
+    // Returns its guest object, or 0 if the handle has none.
+    uint32_t ReferenceObject(uint32_t handle);
     void UnregisterGuestObject(uint32_t guestObject);
     std::shared_ptr<KernelObject> LookupGuestObject(uint32_t guestObject);
 

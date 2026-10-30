@@ -1,6 +1,8 @@
 // NetDll exports for an offline console: the stack starts, but there is no network to use.
 // Every NetDll call takes the caller type (title or system) as its first argument.
+// Also Xbox Live sessions (XamSession*).
 #include "guest_abi.h"
+#include "kernel/objects.h"
 #include "log.h"
 #include "xam/xam.h"
 
@@ -98,6 +100,42 @@ namespace
     uint32_t NetDll_XNetXnAddrToInAddr(uint32_t, uint32_t, uint32_t, uint32_t) { return kWsaENetDown; }
 
     uint32_t XNetLogonGetTitleID() { return xam::kTitleId; }
+
+    // Xbox Live sessions. XSessionCreate makes a session object with XamSessionCreateHandle, takes a reference to it and
+    // passes it to XAM's Live app (XMsg 0xFB message 0xB0010), which makes no sessions offline (messages.cpp): the
+    // creation fails there, and XSessionCreate closes the handle.
+    class Session : public kernel::GuestBackedObject
+    {
+    public:
+        Session() : GuestBackedObject(sizeof(kernel::DispatcherHeader))
+        {
+            Header()->type = uint8_t(kernel::DispatcherType::NotificationEvent);
+            Header()->size = sizeof(kernel::DispatcherHeader) / 4;
+        }
+        const char* TypeName() const override { return "Session"; }
+    };
+
+    uint32_t XamSessionCreateHandle(be<uint32_t>* handle)
+    {
+        if (!handle)
+            return xam::kErrorInvalidParameter;
+        auto session = std::make_shared<Session>();
+        kernel::RegisterGuestObject(session);
+        *handle = kernel::CreateHandle(session);
+        LOG_INFO("XamSessionCreateHandle: 0x%08X", uint32_t(*handle));
+        return xam::kErrorSuccess;
+    }
+
+    // The session's object, with a reference ObDereferenceObject releases.
+    uint32_t XamSessionRefObjByHandle(uint32_t handle, be<uint32_t>* object)
+    {
+        if (!kernel::LookupHandleAs<Session>(handle))
+            return 6; // ERROR_INVALID_HANDLE
+        const uint32_t guestObject = kernel::ReferenceObject(handle);
+        if (object)
+            *object = guestObject;
+        return xam::kErrorSuccess;
+    }
 }
 
 GUEST_EXPORT(NetDll_XNetStartup, NetDll_XNetStartup)
@@ -117,3 +155,5 @@ GUEST_EXPORT(NetDll_XNetQosRelease, NetDll_XNetQosRelease)
 GUEST_EXPORT(NetDll_XNetInAddrToXnAddr, NetDll_XNetInAddrToXnAddr)
 GUEST_EXPORT(NetDll_XNetXnAddrToInAddr, NetDll_XNetXnAddrToInAddr)
 GUEST_EXPORT(XNetLogonGetTitleID, XNetLogonGetTitleID)
+GUEST_EXPORT(XamSessionCreateHandle, XamSessionCreateHandle)
+GUEST_EXPORT(XamSessionRefObjByHandle, XamSessionRefObjByHandle)

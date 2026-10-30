@@ -173,6 +173,7 @@ namespace
         request.directory = createOptions & 0x1;       // FILE_DIRECTORY_FILE
         request.nonDirectory = createOptions & 0x40;   // FILE_NON_DIRECTORY_FILE
         request.write = desiredAccess & kWriteAccess;
+        request.raw = relative.empty() && !path.empty() && path.back() != '\\' && !request.directory;
 
         std::unique_ptr<vfs::File> file;
         vfs::OpenResult result = vfs::OpenResult::Opened;
@@ -422,8 +423,14 @@ namespace
             break;
         case FileAllocationInformation:
             break; // preallocation is a hint
-        case FileBasicInformation:
-            break; // timestamps/attributes aren't stored
+        case FileBasicInformation: // creation, access, write and change times (0: unchanged), attributes (not kept)
+        {
+            if (length < 0x28)
+                return kInfoLengthMismatch;
+            const auto* times = reinterpret_cast<const be<uint64_t>*>(information);
+            result = file->file->SetTimes(times[0], times[1], times[2], times[3]);
+            break;
+        }
         case FileDispositionInformation:
             if (information[0])
                 result = file->file->SetDeleteOnClose();
@@ -470,7 +477,8 @@ namespace
         if (!information)
             return status::kInvalidParameter;
 
-        constexpr uint32_t kSectorSize = 512, kSectorsPerUnit = 32;
+        constexpr uint32_t kSectorSize = 512;
+        const uint32_t sectorsPerUnit = std::max<uint32_t>(1, file->device->BytesPerCluster() / kSectorSize);
         uint32_t written = 0;
         switch (informationClass)
         {
@@ -484,9 +492,9 @@ namespace
         case FileFsSizeInformation:
             if (length < 0x18)
                 return kInfoLengthMismatch;
-            *reinterpret_cast<be<uint64_t>*>(information + 0x00) = file->device->TotalBytes() / (kSectorSize * kSectorsPerUnit);
-            *reinterpret_cast<be<uint64_t>*>(information + 0x08) = file->device->FreeBytes() / (kSectorSize * kSectorsPerUnit);
-            *reinterpret_cast<be<uint32_t>*>(information + 0x10) = kSectorsPerUnit;
+            *reinterpret_cast<be<uint64_t>*>(information + 0x00) = file->device->TotalBytes() / (kSectorSize * sectorsPerUnit);
+            *reinterpret_cast<be<uint64_t>*>(information + 0x08) = file->device->FreeBytes() / (kSectorSize * sectorsPerUnit);
+            *reinterpret_cast<be<uint32_t>*>(information + 0x10) = sectorsPerUnit;
             *reinterpret_cast<be<uint32_t>*>(information + 0x14) = kSectorSize;
             written = 0x18;
             break;
@@ -607,13 +615,20 @@ namespace
         return result;
     }
 
-    uint32_t NtDeviceIoControlFile(uint32_t handle, uint32_t /*event*/, uint32_t /*apcRoutine*/, uint32_t /*apcContext*/, IoStatusBlock* iosb,
-        uint32_t ioControlCode, uint32_t /*input*/, uint32_t /*inputLength*/, uint32_t /*output*/, uint32_t /*outputLength*/)
+    uint32_t NtDeviceIoControlFile(uint32_t handle, uint32_t event, uint32_t /*apcRoutine*/, uint32_t /*apcContext*/, IoStatusBlock* iosb,
+        uint32_t ioControlCode, uint32_t /*input*/, uint32_t /*inputLength*/, void* output, uint32_t outputLength)
     {
         auto file = LookupHandleAs<FileObject>(handle);
-        LOG_WARN("NtDeviceIoControlFile(\"%s\", 0x%08X): not supported", file ? file->path.c_str() : "?", ioControlCode);
-        SetIoStatus(iosb, status::kNotImplemented, 0);
-        return status::kNotImplemented;
+        if (!file)
+            return status::kInvalidHandle;
+        uint32_t returned = 0;
+        guest::BeforeHostWriteTo(output, outputLength);
+        const uint32_t result = file->file->IoControl(ioControlCode, output, outputLength, returned);
+        if (result != status::kSuccess)
+            LOG_WARN("NtDeviceIoControlFile(\"%s\", 0x%08X): 0x%08X", file->path.c_str(), ioControlCode, result);
+        SetIoStatus(iosb, result, returned);
+        SignalCompletion(event);
+        return result;
     }
 
     uint32_t IoDismountVolumeByFileHandle(uint32_t /*handle*/)
@@ -635,6 +650,54 @@ namespace
     {
         return vfs::RemoveSymbolicLink(ReadString(link)) ? status::kSuccess : status::kObjectNameNotFound;
     }
+
+    // ---------------------------------------------------------------------------------------------
+    // STFS devices. XAPI's secure utility drive (XMountUtilityDrive for titles without the insecure utility drive
+    // privilege, DOAX2's cache:) formats a cache partition as FATX, then has a XAM task create an STFS volume over the raw
+    // partition and link cache: to it. The volume's files are kept as the partition's host files instead: the STFS
+    // device's name becomes a link to the partition's file system.
+
+    // What XAPI's utility drive task passes (the fields it sets; 0x58 bytes).
+    struct StfsCreateParameters
+    {
+        CountedString deviceName;     // 0x00 "\Device\cache0"
+        be<uint64_t> blockSize;       // 0x08 4096
+        be<uint64_t> volumeSize;      // 0x10 the partition's size
+        be<uint32_t> partitionHandle; // 0x18 the raw partition, opened read/write
+        uint8_t volumeDescriptor[36]; // 0x1C kept in Partition0's cache header; zeros for a new volume
+        be<uint32_t> cacheBuffer;     // 0x40 memory for the volume's block cache
+        be<uint32_t> unknown44;
+        be<uint32_t> deviceObject;    // 0x48 returned: StfsControlDevice and ObDereferenceObject take it
+    };
+    static_assert(offsetof(StfsCreateParameters, deviceObject) == 0x48);
+
+    uint32_t StfsCreateDevice(StfsCreateParameters* parameters, uint32_t /*parametersSize*/)
+    {
+        if (!parameters)
+            return status::kInvalidParameter;
+        auto partition = LookupHandleAs<FileObject>(parameters->partitionHandle);
+        const std::string name = ReadString(&parameters->deviceName);
+        if (!partition || name.empty())
+            return status::kInvalidParameter;
+        vfs::AddSymbolicLink(name, partition->path);
+        static const uint32_t deviceObject = guest::KernelAlloc(0x40);
+        parameters->deviceObject = deviceObject;
+        LOG_INFO("STFS device %s over %s, as host files", name.c_str(), partition->path.c_str());
+        return status::kSuccess;
+    }
+
+    // Flushes, and reading and writing the volume descriptor: the files are host files, so there's nothing to do.
+    uint32_t StfsControlDevice(uint32_t /*deviceObject*/, uint32_t /*code*/, uint32_t /*buffer*/)
+    {
+        return status::kSuccess;
+    }
+
+    // XSetFileCacheSize: the file system cache's size in 4 KB pages. Host files are cached by the host.
+    uint32_t FscSetCacheElementCount(uint32_t /*unknown*/, uint32_t pages)
+    {
+        LOG_TRACE("FscSetCacheElementCount(%u pages)", pages);
+        return status::kSuccess;
+    }
 }
 
 GUEST_EXPORT(NtCreateFile, NtCreateFile)
@@ -651,3 +714,6 @@ GUEST_EXPORT(NtDeviceIoControlFile, NtDeviceIoControlFile)
 GUEST_EXPORT(IoDismountVolumeByFileHandle, IoDismountVolumeByFileHandle)
 GUEST_EXPORT(ObCreateSymbolicLink, ObCreateSymbolicLink)
 GUEST_EXPORT(ObDeleteSymbolicLink, ObDeleteSymbolicLink)
+GUEST_EXPORT(StfsCreateDevice, StfsCreateDevice)
+GUEST_EXPORT(StfsControlDevice, StfsControlDevice)
+GUEST_EXPORT(FscSetCacheElementCount, FscSetCacheElementCount)

@@ -4,11 +4,9 @@
 #include "disc_image.h"
 
 #include <algorithm>
-#include <cstdio>
 #include <cwchar>
 
 #include <windows.h>
-#include <bcrypt.h>
 
 namespace launcher
 {
@@ -75,7 +73,7 @@ namespace launcher
         std::wstring CannotWrite(const std::wstring& path, DWORD error)
         {
             return L"Can't write " + path + L": " + SystemMessage(error) +
-                L"\n\nPut the game in a folder you can change, such as one in Documents (not Program Files).";
+                L"\n\nMove the game to a folder you can change, such as one in Documents.";
         }
     }
 
@@ -252,47 +250,6 @@ namespace launcher
         return error;
     }
 
-    std::string FileSha256(const std::wstring& path)
-    {
-        const HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (file == INVALID_HANDLE_VALUE)
-            return {};
-        BCRYPT_ALG_HANDLE algorithm = nullptr;
-        BCRYPT_HASH_HANDLE hash = nullptr;
-        bool ok = BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(&algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) &&
-            BCRYPT_SUCCESS(BCryptCreateHash(algorithm, &hash, nullptr, 0, nullptr, 0, 0));
-        std::vector<uint8_t> buffer(1 << 20);
-        while (ok)
-        {
-            DWORD read = 0;
-            if (!ReadFile(file, buffer.data(), DWORD(buffer.size()), &read, nullptr))
-                ok = false;
-            else if (read == 0)
-                break;
-            else
-                ok = BCRYPT_SUCCESS(BCryptHashData(hash, buffer.data(), read, 0));
-        }
-        uint8_t digest[32];
-        ok = ok && BCRYPT_SUCCESS(BCryptFinishHash(hash, digest, sizeof(digest), 0));
-        if (hash)
-            BCryptDestroyHash(hash);
-        if (algorithm)
-            BCryptCloseAlgorithmProvider(algorithm, 0);
-        CloseHandle(file);
-        if (!ok)
-            return {};
-        char text[65];
-        for (int i = 0; i < 32; i++)
-            snprintf(text + i * 2, 3, "%02x", digest[i]);
-        return text;
-    }
-
-    std::wstring Megabytes(uint64_t bytes)
-    {
-        return std::to_wstring((bytes + (1u << 19)) >> 20) + L" MB";
-    }
-
     std::wstring Quote(const std::wstring& argument)
     {
         if (!argument.empty() && argument.find_first_of(L" \t\n\v\"") == std::wstring::npos)
@@ -374,38 +331,17 @@ namespace launcher
         }
         folder.root = ParentOf(path);
         folder.data = data.empty() ? Join(folder.root, L"data") : FullPath(data);
-        folder.development = !IsDirectory(folder.Recomp());
         return folder;
     }
 
     std::wstring MissingFile(const Folder& folder)
     {
-        std::vector<std::wstring> files = { L"" GAME_EXECUTABLE ".exe" };
-        if (!folder.development)
-        {
-            for (const wchar_t* file : { L"toolchain\\bin\\clang.exe", L"toolchain\\bin\\lld-link.exe", L"toolchain\\XenonRecomp.exe",
-                     L"recomp\\config\\" GAME_PREFIX ".toml", L"recomp\\include\\ppc_context.h", L"recomp\\include\\ppc_overrides.h",
-                     L"recomp\\src\\module.cpp", L"recomp\\compile.rsp", L"recomp\\link.rsp", L"recomp\\" GAME_EXECUTABLE ".def",
-                     L"recomp\\" GAME_EXECUTABLE "_ppc.def", L"recomp\\" GAME_EXECUTABLE "_ppc.sha256" })
-                files.push_back(file);
-        }
-        for (const std::wstring& file : files)
+        for (const wchar_t* file : { L"" GAME_EXECUTABLE ".exe", L"" GAME_EXECUTABLE "_ppc.dll" })
         {
             if (!IsFile(Join(folder.root, file)))
                 return file;
         }
         return {};
-    }
-
-    std::string ExpectedModuleHash(const Folder& folder)
-    {
-        const std::vector<std::string> lines = ReadLines(folder.ExpectedHashFile());
-        if (lines.empty())
-            return {};
-        std::string hash = Trim(lines[0]).substr(0, 64);
-        std::transform(hash.begin(), hash.end(), hash.begin(), [](unsigned char c) { return char(std::tolower(c)); });
-        const bool hex = hash.size() == 64 && hash.find_first_not_of("0123456789abcdef") == std::string::npos;
-        return hex ? hash : std::string();
     }
 
     std::wstring CheckDisc(const std::wstring& chosen, Disc& disc)
@@ -426,17 +362,16 @@ namespace launcher
         // The game's paths are narrow strings, in this PC's code page for programs that aren't Unicode.
         const std::string narrow = NarrowPath(path);
         if (narrow.empty())
-            return L"The game can't open " + path + L": its path has characters that this PC's code page for older programs "
-                L"lacks. Move the disc image to a folder whose path has none, such as C:\\Games, or rename it.";
+            return L"The game can't open " + path + L": its path has characters it can't use. Move the disc image to a folder "
+                L"such as C:\\Games, or rename it.";
         std::vector<uint8_t> xex;
         switch (disc::ReadExecutable(narrow, xex))
         {
         case disc::Check::kOk:
             break;
         case disc::Check::kUnreadable:
-            return name + L" isn't an Xbox 360 disc image.";
         case disc::Check::kOtherGame:
-            return name + L" is another game, or another version of " GAME_TITLE " than " GAME_VERSION " (" GAME_REGION ").";
+            return name + L" doesn't appear to be a valid " GAME_DISC " disc image.";
         }
         disc.path = path;
         disc.narrow = narrow;

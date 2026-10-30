@@ -1,9 +1,7 @@
 // The launcher's window (window.h). Plain Win32 controls in a window laid out at its monitor's scale (per-monitor DPI
 // aware, from the manifest): a white area with what's going on and the choices, and a band with the buttons. The
-// checks and the build run on a thread of their own (Prepare), which reports to the window by messages.
+// checks run on a thread of their own (Prepare), which reports to the window by messages.
 #include "launcher/window.h"
-
-#include "launcher/build.h"
 
 #include <algorithm>
 #include <mutex>
@@ -11,7 +9,6 @@
 
 #include <windows.h>
 #include <commctrl.h>
-#include <shellapi.h>
 #include <shlwapi.h>
 #include <shobjidl.h>
 
@@ -19,7 +16,7 @@ namespace launcher
 {
     namespace
     {
-        constexpr wchar_t kClassName[] = L"" GAME_PREFIX "Launcher", kTextClassName[] = L"" GAME_PREFIX "LauncherText";
+        constexpr wchar_t kClassName[] = L"" GAME_PREFIX "Launcher";
         constexpr wchar_t kTitle[] = L"" GAME_TITLE " Launcher";
         constexpr UINT kReportMessage = WM_APP + 1, kDoneMessage = WM_APP + 2;
         constexpr UINT_PTR kShowTimer = 1;
@@ -38,8 +35,6 @@ namespace launcher
             kDiscLabel,
             kDiscPath,
             kDiscChange,
-            kProgress,
-            kProgressText,
             kLocal,
             kNetplay,
             kHost,
@@ -54,7 +49,6 @@ namespace launcher
             kLockstep,
             kRollback,
             kNoteText,
-            kShowLog,
             kPrimary = IDOK,
             kSecondary = IDCANCEL,
         };
@@ -63,12 +57,8 @@ namespace launcher
         {
             kChecking,
             kNeedDisc,
-            kWaiting,
-            kBuilding,
             kReady,
             kFailed,
-            kCancelled,
-            kStopping,
         };
 
         struct State
@@ -83,15 +73,13 @@ namespace launcher
             Choices choices;
             std::wstring discPath; // the disc image in use, once it checks out
             Screen screen = Screen::kChecking;
-            std::wstring message;  // what's wrong, for the need-disc and failed screens
-            std::wstring status;   // the checks' latest
-            bool buildRan = false; // the last preparation built the module
-            bool closing = false;
+            std::wstring message; // what's wrong, for the need-disc and failed screens
+            std::wstring status;  // the checks' latest
+            bool closing = false; // closed while the checks ran: the window goes when they're done
 
-            Build build;
             std::thread worker;
             std::mutex lock; // the worker's results, below
-            Report report;
+            std::wstring report;
             bool reportPosted = false;
             Readiness result = Readiness::kFailed;
             std::wstring resultMessage, resultDisc;
@@ -190,49 +178,6 @@ namespace launcher
             s.headingFont = heading;
         }
 
-        // The build's progress text, which changes a few times a second: drawn whole into a bitmap and copied at once. A
-        // static control erases its background and then draws, and a frame between showed it blank.
-        LRESULT CALLBACK TextProc(HWND window, UINT message, WPARAM wParam, LPARAM lParam)
-        {
-            switch (message)
-            {
-            case WM_SETTEXT:
-            {
-                const LRESULT result = DefWindowProcW(window, message, wParam, lParam);
-                InvalidateRect(window, nullptr, FALSE);
-                return result;
-            }
-            case WM_ERASEBKGND:
-                return 1;
-            case WM_PAINT:
-            {
-                PAINTSTRUCT paint;
-                const HDC dc = BeginPaint(window, &paint);
-                RECT client{};
-                GetClientRect(window, &client);
-                const HDC memory = CreateCompatibleDC(dc);
-                const HBITMAP bitmap = CreateCompatibleBitmap(dc, std::max<LONG>(client.right, 1), std::max<LONG>(client.bottom, 1));
-                const HGDIOBJ oldBitmap = SelectObject(memory, bitmap);
-                FillRect(memory, &client, g_state->background);
-                const HGDIOBJ oldFont = SelectObject(memory, g_state->font);
-                SetTextColor(memory, kNoteColor);
-                SetBkMode(memory, TRANSPARENT);
-                std::wstring shown(size_t(GetWindowTextLengthW(window)) + 1, L'\0');
-                shown.resize(size_t(GetWindowTextW(window, shown.data(), int(shown.size()))));
-                DrawTextW(memory, shown.c_str(), int(shown.size()), &client, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
-                BitBlt(dc, 0, 0, client.right, client.bottom, memory, 0, 0, SRCCOPY);
-                SelectObject(memory, oldFont);
-                SelectObject(memory, oldBitmap);
-                DeleteObject(bitmap);
-                DeleteDC(memory);
-                EndPaint(window, &paint);
-                return 0;
-            }
-            default:
-                return DefWindowProcW(window, message, wParam, lParam);
-            }
-        }
-
         void CreateControls(HINSTANCE instance)
         {
             const auto add = [&](int id, const wchar_t* type, const wchar_t* text, DWORD style, DWORD exStyle = 0) {
@@ -244,8 +189,6 @@ namespace launcher
             add(kDiscLabel, WC_STATICW, L"Disc image", label);
             add(kDiscPath, WC_STATICW, L"", SS_LEFTNOWORDWRAP | SS_NOPREFIX); // its text compacted to fit (Layout)
             add(kDiscChange, WC_BUTTONW, L"&Change...", BS_PUSHBUTTON | WS_TABSTOP | WS_GROUP);
-            add(kProgress, PROGRESS_CLASSW, L"", PBS_SMOOTH);
-            add(kProgressText, kTextClassName, L"", 0); // (TextProc)
             add(kLocal, WC_BUTTONW, L"Pl&ay", radio | WS_GROUP);
             add(kNetplay, WC_BUTTONW, L"&Netplay: Versus with another PC", radio);
             // A radio button group runs from a WS_GROUP control to the next (in this order, which is also the tab order).
@@ -261,10 +204,8 @@ namespace launcher
             add(kLockstep, WC_BUTTONW, L"Lock&step", radio | WS_GROUP); // (&Launch has L)
             add(kRollback, WC_BUTTONW, L"&Rollback", radio);
             add(kNoteText, WC_STATICW, kNote, label | WS_GROUP);
-            add(kShowLog, WC_BUTTONW, L"Show &log", BS_PUSHBUTTON | WS_TABSTOP | WS_GROUP);
             add(kPrimary, WC_BUTTONW, L"&Launch", BS_DEFPUSHBUTTON | WS_TABSTOP | WS_GROUP);
             add(kSecondary, WC_BUTTONW, L"Close", WS_VISIBLE | BS_PUSHBUTTON | WS_TABSTOP);
-            SendMessageW(Control(kProgress), PBM_SETRANGE32, 0, 1000);
             SendMessageW(Control(kHostPort), EM_SETLIMITTEXT, 5, 0);
             SendMessageW(Control(kJoinPort), EM_SETLIMITTEXT, 5, 0);
             SendMessageW(Control(kAddress), EM_SETLIMITTEXT, 253, 0);
@@ -360,13 +301,6 @@ namespace launcher
                 place(kDiscChange, margin + inner - buttonWidth, y, buttonWidth, row);
                 y += row + Scale(16);
             }
-            if (Visible(kProgress))
-            {
-                place(kProgress, margin, y, inner, Scale(14));
-                y += Scale(14) + Scale(6);
-                place(kProgressText, margin, y, inner, line);
-                y += line + Scale(16);
-            }
             if (Visible(kLocal))
             {
                 const int radio = Scale(22);
@@ -418,8 +352,6 @@ namespace launcher
                 place(id, x, y + padding, buttonWidth, button);
                 x -= Scale(8);
             }
-            if (Visible(kShowLog))
-                place(kShowLog, margin, y + padding, ButtonWidth(kShowLog), button);
             const int height = y + 2 * padding + button;
 
             // The window around that, kept on its monitor.
@@ -441,8 +373,8 @@ namespace launcher
         void ShowScreen()
         {
             State& s = *g_state;
-            std::wstring heading, body, primary = L"&Launch", secondary = L"Close";
-            bool showPrimary = true, primaryEnabled = true, showDisc = !s.discPath.empty(), showProgress = false, showPlay = false, showLog = false;
+            std::wstring heading, body, primary = L"&Launch";
+            bool showPrimary = true, showDisc = !s.discPath.empty(), showPlay = false;
             switch (s.screen)
             {
             case Screen::kChecking:
@@ -451,45 +383,19 @@ namespace launcher
                 showPrimary = false;
                 break;
             case Screen::kNeedDisc:
-                heading = L"Choose your disc image";
-                body = (s.message.empty() ? L"" : s.message + L"\n\n") + L"The game runs from your own disc image of " GAME_TITLE " (" GAME_VERSION
-                    ") (" GAME_REGION "). The launcher builds the game's code from it once, which can take a few minutes depending on your PC.";
-                primary = L"&Choose disc image...";
+                heading = L"Select your " GAME_DISC " disc image";
+                body = s.message; // what's wrong with the one tried, if one was
+                primary = L"&Select disc image...";
                 showDisc = false;
-                break;
-            case Screen::kWaiting:
-                heading = L"Waiting";
-                body = s.status;
-                showPrimary = false;
-                secondary = L"Cancel";
-                break;
-            case Screen::kBuilding:
-                heading = L"Building the game's code";
-                body = L"This happens once, and can take a few minutes depending on your PC.";
-                primaryEnabled = false;
-                secondary = L"Cancel";
-                showProgress = true;
                 break;
             case Screen::kReady:
                 heading = L"Ready to play";
                 showPlay = true;
                 break;
             case Screen::kFailed:
-                heading = L"Something's wrong";
+                heading = L"Can't start the game";
                 body = s.message;
                 primary = L"&Try again";
-                showLog = s.buildRan && IsFile(s.folder.BuildLog());
-                break;
-            case Screen::kCancelled:
-                heading = L"Build cancelled";
-                body = L"Its files are deleted. Build the game's code when you're ready: it can take a few minutes depending on your PC.";
-                primary = L"&Build";
-                break;
-            case Screen::kStopping:
-                heading = L"Stopping";
-                body = L"Stopping the build and deleting its files...";
-                showPrimary = false;
-                secondary = L"Cancel";
                 break;
             }
             const bool busy = s.worker.joinable();
@@ -498,11 +404,10 @@ namespace launcher
             for (const int id : { kDiscLabel, kDiscPath, kDiscChange })
                 Show(id, showDisc);
             EnableWindow(Control(kDiscChange), !busy);
-            Show(kProgress, showProgress);
-            Show(kProgressText, showProgress);
-            Show(kLocal, showPlay);
-            Show(kNetplay, showPlay);
-            const bool netplay = showPlay && Checked(kNetplay);
+            // A game without netplay (GAME_NETPLAY 0) just plays: no choices.
+            Show(kLocal, showPlay && GAME_NETPLAY);
+            Show(kNetplay, showPlay && GAME_NETPLAY);
+            const bool netplay = GAME_NETPLAY && showPlay && Checked(kNetplay);
             for (const int id : { kHost, kHostPortLabel, kHostPort, kJoin, kAddressLabel, kAddress, kJoinPortLabel, kJoinPort, kFightsLabel, kLockstep,
                      kRollback, kNoteText })
                 Show(id, netplay);
@@ -511,12 +416,9 @@ namespace launcher
             EnableWindow(Control(kHostPortLabel), host);
             for (const int id : { kAddress, kAddressLabel, kJoinPort, kJoinPortLabel })
                 EnableWindow(Control(id), !host);
-            Show(kShowLog, showLog);
             SetText(kPrimary, primary);
             Show(kPrimary, showPrimary);
-            EnableWindow(Control(kPrimary), showPrimary && primaryEnabled);
-            SetText(kSecondary, secondary);
-            EnableWindow(Control(kSecondary), s.screen != Screen::kStopping);
+            EnableWindow(Control(kPrimary), showPrimary);
             Layout();
             // The keyboard's focus on something that's still there.
             const HWND focus = GetFocus();
@@ -524,14 +426,12 @@ namespace launcher
                 SetFocus(IsWindowEnabled(Control(kPrimary)) && Visible(kPrimary) ? Control(kPrimary) : Control(kSecondary));
         }
 
-        // The checks and, if needed, the build, on the worker thread.
+        // The checks, on the worker thread.
         void StartPreparing(const std::wstring& chosen)
         {
             State& s = *g_state;
             if (s.worker.joinable())
                 return;
-            s.build.Reset();
-            s.buildRan = false;
             s.message.clear();
             s.status = L"Checking...";
             s.screen = Screen::kChecking;
@@ -540,11 +440,11 @@ namespace launcher
                 std::wstring message;
                 Disc disc;
                 const Readiness result = Prepare(
-                    s.folder, chosen, s.build,
-                    [](const Report& report) {
+                    s.folder, chosen,
+                    [](const std::wstring& text) {
                         State& s = *g_state;
                         std::lock_guard lock(s.lock);
-                        s.report = report;
+                        s.report = text;
                         if (!s.reportPosted)
                         {
                             s.reportPosted = true;
@@ -572,8 +472,8 @@ namespace launcher
                 return chosen;
             const COMDLG_FILTERSPEC types[] = { { L"Disc images (*.iso)", L"*.iso" }, { L"All files", L"*.*" } };
             dialog->SetFileTypes(2, types);
-            dialog->SetTitle(L"Your disc image of " GAME_TITLE " (" GAME_VERSION ") (" GAME_REGION ")");
-            dialog->SetOkButtonLabel(L"Choose");
+            dialog->SetTitle(L"Select your " GAME_DISC " disc image");
+            dialog->SetOkButtonLabel(L"Select");
             FILEOPENDIALOGOPTIONS options = 0;
             dialog->GetOptions(&options);
             dialog->SetOptions(options | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST | FOS_PATHMUSTEXIST | FOS_NOCHANGEDIR);
@@ -625,45 +525,19 @@ namespace launcher
         void OnReport()
         {
             State& s = *g_state;
-            Report report;
+            std::wstring text;
             {
                 std::lock_guard lock(s.lock);
-                report = s.report;
+                text = s.report;
                 s.reportPosted = false;
             }
             if (s.closing)
                 return;
-            switch (report.phase)
+            if (s.screen == Screen::kChecking && s.status != text)
             {
-            case Report::Phase::kBuilding:
-                s.buildRan = true;
-                if (s.screen != Screen::kBuilding)
-                {
-                    s.screen = Screen::kBuilding;
-                    ShowScreen();
-                }
-                // Only what changed: a static control redraws itself whenever its text is set, and the build reports ten
-                // times a second.
-                if (const int position = int(report.fraction * 1000); position != int(SendMessageW(Control(kProgress), PBM_GETPOS, 0, 0)))
-                    SendMessageW(Control(kProgress), PBM_SETPOS, WPARAM(position), 0);
-                if (report.text != Text(kProgressText))
-                    SetText(kProgressText, report.text);
-                break;
-            case Report::Phase::kWaiting:
-                s.status = report.text;
-                s.screen = Screen::kWaiting;
-                ShowScreen();
-                break;
-            case Report::Phase::kChecking:
-                if (s.screen == Screen::kChecking && s.status != report.text)
-                {
-                    s.status = report.text;
-                    SetText(kBody, s.status);
-                }
-                break;
+                s.status = text;
+                SetText(kBody, s.status);
             }
-            if (!IsWindowVisible(s.window) && report.phase != Report::Phase::kChecking)
-                ShowWindow(s.window, SW_SHOW);
         }
 
         void OnDone()
@@ -692,9 +566,6 @@ namespace launcher
                     break;
                 case Readiness::kFailed:
                     s.screen = Screen::kFailed;
-                    break;
-                case Readiness::kCancelled:
-                    s.screen = Screen::kCancelled;
                     break;
                 }
             }
@@ -745,7 +616,7 @@ namespace launcher
                 if (_wcsicmp(type, WC_EDITW) == 0)
                     break; // a disabled edit box: Windows' gray
                 const int id = GetDlgCtrlID(control);
-                SetTextColor(dc, id == kHeading ? kHeadingColor : id == kNoteText || id == kProgressText ? kNoteColor : GetSysColor(COLOR_WINDOWTEXT));
+                SetTextColor(dc, id == kHeading ? kHeadingColor : id == kNoteText ? kNoteColor : GetSysColor(COLOR_WINDOWTEXT));
                 SetBkColor(dc, GetSysColor(COLOR_WINDOW));
                 return LRESULT(s.background);
             }
@@ -764,23 +635,14 @@ namespace launcher
                         ChooseDisc();
                     else if (s.screen == Screen::kReady)
                         Play();
-                    else if (s.screen == Screen::kFailed || s.screen == Screen::kCancelled)
+                    else if (s.screen == Screen::kFailed)
                         StartPreparing(s.discPath);
                     return 0;
                 case kSecondary:
-                    if (s.worker.joinable())
-                    {
-                        s.build.Cancel();
-                        SetText(kProgressText, L"Cancelling...");
-                    }
-                    else
-                        SendMessageW(window, WM_CLOSE, 0, 0);
+                    SendMessageW(window, WM_CLOSE, 0, 0);
                     return 0;
                 case kDiscChange:
                     ChooseDisc();
-                    return 0;
-                case kShowLog:
-                    ShellExecuteW(window, L"open", s.folder.BuildLog().c_str(), nullptr, nullptr, SW_SHOWNORMAL);
                     return 0;
                 case kLocal:
                 case kNetplay:
@@ -827,11 +689,9 @@ namespace launcher
             case WM_CLOSE:
                 if (s.worker.joinable())
                 {
-                    // Ended and cleaned up first: the window closes when the build has.
+                    // The checks take a moment: the window closes when they're done (OnDone).
                     s.closing = true;
-                    s.build.Cancel();
-                    s.screen = Screen::kStopping;
-                    ShowScreen();
+                    ShowWindow(window, SW_HIDE);
                     return 0;
                 }
                 SaveTheChoices();
@@ -854,7 +714,7 @@ namespace launcher
         state.folder = folder;
         state.choices = choices;
         const HINSTANCE instance = GetModuleHandleW(nullptr);
-        INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_STANDARD_CLASSES | ICC_PROGRESS_CLASS };
+        INITCOMMONCONTROLSEX controls{ sizeof(controls), ICC_STANDARD_CLASSES };
         InitCommonControlsEx(&controls);
 
         WNDCLASSEXW type{};
@@ -865,14 +725,6 @@ namespace launcher
         type.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
         type.lpszClassName = kClassName;
         if (!RegisterClassExW(&type))
-            return 1;
-        WNDCLASSEXW textType{};
-        textType.cbSize = sizeof(textType);
-        textType.lpfnWndProc = TextProc;
-        textType.hInstance = instance;
-        textType.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-        textType.lpszClassName = kTextClassName;
-        if (!RegisterClassExW(&textType))
             return 1;
         state.background = GetSysColorBrush(COLOR_WINDOW);
         state.separator = GetSysColorBrush(COLOR_3DLIGHT);
@@ -907,10 +759,7 @@ namespace launcher
             }
         }
         if (state.worker.joinable())
-        {
-            state.build.Cancel();
             state.worker.join();
-        }
         if (state.font)
             DeleteObject(state.font);
         if (state.headingFont)

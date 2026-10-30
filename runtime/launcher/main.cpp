@@ -1,21 +1,19 @@
-// The launcher's entry point (launcher.h): its window, or with --build or --play the same work without it.
+// The launcher's entry point (launcher.h): its window, or with --check or --play the same work without it.
 //
-// Usage: "<GAME_PREFIX> Launcher.exe" [--disc <disc image>] [--data <folder>] [--build | --play [--wait]]
+// Usage: "<GAME_PREFIX> Launcher.exe" [--disc <disc image>] [--data <folder>] [--check | --play [--wait]]
 //          [--netplay off|host:<port>|join:<address>:<port>] [--lockstep | --rollback]
 //   --disc     the disc image, checked and remembered as if chosen in the window
 //   --data     the game's data directory (default: data, next to the launcher), e.g. for two instances on one PC
-//   --build    builds the game's code if it's missing or isn't the release's, without the window: exit code 0 once it's
-//              ready, 1 if something's wrong, 2 if cancelled (DEBUG_LAUNCHER_CANCEL), 3 without a disc image
+//   --check    checks the release and the disc image without the window: exit code 0 once they're right, 1 if
+//              something's wrong, 3 without a disc image
 //   --play     the same, then starts the game; with --wait, waits for it and exits with its exit code, and ending the
 //              launcher ends the game (for tests)
 //   --netplay, --lockstep, --rollback: how to play, remembered as the window's choices
-// Without --build or --play the window opens, with those options applied. Messages go to the standard output when there
+// Without --check or --play the window opens, with those options applied. Messages go to the standard output when there
 // is one, or else to the console the launcher was started from.
-#include "launcher/build.h"
 #include "launcher/launcher.h"
 #include "launcher/window.h"
 
-#include <chrono>
 #include <cstdlib>
 #include <cwchar>
 
@@ -27,18 +25,26 @@ namespace
 {
     using namespace launcher;
 
-    const wchar_t kUsage[] = L"Usage: \"" GAME_PREFIX " Launcher.exe\" [--disc <disc image>] [--data <folder>] [--build | --play [--wait]]\n"
-                             L"    [--netplay off|host:<port>|join:<address>:<port>] [--lockstep | --rollback]\n\n"
+    // A game without netplay (GAME_NETPLAY 0, CMakeLists.txt) takes only --netplay off.
+    const wchar_t kUsage[] = L"Usage: \"" GAME_PREFIX " Launcher.exe\" [--disc <disc image>] [--data <folder>] [--check | --play [--wait]]\n"
+#if GAME_NETPLAY
+                             L"    [--netplay off|host:<port>|join:<address>:<port>] [--lockstep | --rollback]\n"
+#endif
+                             L"\n"
                              L"--disc: the disc image to use, checked and remembered.\n"
                              L"--data: the game's data folder (default: data, next to the launcher).\n"
-                             L"--build: builds the game's code if it's needed, without the window.\n"
+                             L"--check: checks the game's files and the disc image, without the window.\n"
+#if GAME_NETPLAY
                              L"--play: the same, then starts the game; --wait waits for it.\n"
                              L"--netplay, --lockstep, --rollback: how to play, remembered.";
+#else
+                             L"--play: the same, then starts the game; --wait waits for it.";
+#endif
 
     struct Options
     {
         std::wstring disc, data;
-        bool build = false, play = false, wait = false, help = false;
+        bool check = false, play = false, wait = false, help = false;
         std::wstring netplay; // off, host:<port> or join:<address>:<port>
         int rollback = -1;    // -1: as remembered
         std::wstring error;
@@ -60,8 +66,8 @@ namespace
                 value(options.disc);
             else if (argument == L"--data")
                 value(options.data);
-            else if (argument == L"--build")
-                options.build = true;
+            else if (argument == L"--check")
+                options.check = true;
             else if (argument == L"--play")
                 options.play = true;
             else if (argument == L"--wait")
@@ -88,6 +94,8 @@ namespace
         const std::wstring& netplay = options.netplay;
         if (netplay.empty())
             return true;
+        if (!GAME_NETPLAY && netplay != L"off")
+            return false;
         const auto port = [](const std::wstring& text) {
             const long number = wcstol(text.c_str(), nullptr, 10);
             return number >= 1 && number <= 65535 ? uint16_t(number) : uint16_t(0);
@@ -151,32 +159,22 @@ namespace
         bool m_console = false;
     };
 
-    // --build and --play: the window's work, reported as lines.
+    // --check and --play: the window's work, reported as lines.
     int RunCommand(const Folder& folder, const Options& options, const Choices& choices)
     {
         Output output;
-        using Clock = std::chrono::steady_clock;
-        Clock::time_point last{};
         std::wstring lastText;
-        const Reporter report = [&](const Report& report) {
-            // Each step, and the build's progress once a second.
-            const Clock::time_point now = Clock::now();
-            if (report.text == lastText || (report.phase == Report::Phase::kBuilding && now - last < std::chrono::seconds(1) && report.fraction < 1))
-                return;
-            last = now;
-            lastText = report.text;
-            output.Line(report.phase == Report::Phase::kBuilding ? L"[" + std::to_wstring(int(report.fraction * 100)) + L"%] " + report.text : report.text);
+        const Reporter report = [&](const std::wstring& text) {
+            if (text != lastText)
+                output.Line(text);
+            lastText = text;
         };
-        Build build;
         std::wstring message;
         Disc disc;
-        const Clock::time_point start = Clock::now();
-        const Readiness result = Prepare(folder, options.disc, build, report, message, disc);
-        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
-        switch (result)
+        switch (Prepare(folder, options.disc, report, message, disc))
         {
         case Readiness::kReady:
-            output.Line(L"Ready (" + std::to_wstring(int(seconds + 0.5)) + L" s): the disc image is " + disc.path + L", and the game's code is the release's.");
+            output.Line(L"Ready: the disc image is " + disc.path + L".");
             break;
         case Readiness::kNeedDisc:
             output.Line(message.empty() ? L"No disc image: give one with --disc <path>." : message);
@@ -184,9 +182,6 @@ namespace
         case Readiness::kFailed:
             output.Line(message);
             return 1;
-        case Readiness::kCancelled:
-            output.Line(L"Cancelled: the build's files are deleted.");
-            return 2;
         }
         if (!options.play)
             return 0;
@@ -218,7 +213,8 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
 {
     // The manifest's, in case it's missing: sizes in pixels at each monitor's scale.
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    // A tool that crashes ends without a dialog (the build reports it); the game gets Windows' default (StartGame).
+    // No dialogs for critical errors (a disc image on a drive that isn't ready is reported as the checks find it); the
+    // game gets Windows' default (StartGame).
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
 
     int count = 0;
@@ -230,7 +226,7 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     {
         const std::wstring text = options.error.empty() ? kUsage : options.error + L"\n\n" + kUsage;
         Output().Line(text);
-        if (options.build || options.play)
+        if (options.check || options.play)
             return 4;
         MessageBoxW(nullptr, text.c_str(), L"" GAME_TITLE " Launcher", options.error.empty() ? MB_ICONINFORMATION : MB_ICONWARNING);
         return 4;
@@ -240,15 +236,16 @@ int WINAPI wWinMain(HINSTANCE, HINSTANCE, PWSTR, int)
     Choices choices = LoadChoices(folder);
     if (!Apply(options, choices))
     {
-        const std::wstring text = L"--netplay is off, host:<port> or join:<address>:<port>, not " + options.netplay;
+        const std::wstring text = GAME_NETPLAY ? L"--netplay is off, host:<port> or join:<address>:<port>, not " + options.netplay
+                                               : L"" GAME_TITLE " has no netplay: --netplay is only off, not " + options.netplay;
         Output().Line(text);
-        if (!options.build && !options.play)
+        if (!options.check && !options.play)
             MessageBoxW(nullptr, text.c_str(), L"" GAME_TITLE " Launcher", MB_ICONWARNING);
         return 4;
     }
     if (!options.netplay.empty() || options.rollback >= 0)
         SaveChoices(folder, choices);
-    if (options.build || options.play)
+    if (options.check || options.play)
         return RunCommand(folder, options, choices);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

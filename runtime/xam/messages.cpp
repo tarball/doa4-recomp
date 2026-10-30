@@ -1,5 +1,6 @@
 // XMsg*: messages to XAM's in-process apps (0xFA music player, 0xFB achievements, 0xFC Live base).
-// Known messages are answered as the offline dashboard would (values per Xenia); others are logged.
+// The music player is xmp.cpp; other known messages are answered as the offline dashboard would (values per Xenia);
+// others are logged.
 #include "guest_abi.h"
 #include "log.h"
 #include "netplay/frame.h"
@@ -14,6 +15,9 @@ namespace
 
     uint32_t Dispatch(uint32_t app, uint32_t message, uint32_t buffer, uint32_t bufferLength)
     {
+        if (app == 0xFA)
+            return xam::XmpDispatch(message, buffer, bufferLength);
+
         if (app == 0xFC && message == 0x00058004)
         {
             // XLiveBase startup query: answers a single boolean.

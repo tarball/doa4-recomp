@@ -77,7 +77,9 @@ namespace kernel
         // a frame boundary.
         std::atomic<uint32_t> waits{ 0 };
         // What it waits for now, for the thread dumps (DumpGuestThreads: written by the thread, read racily): the kind of
-        // wait, and the first object's guest address and the objects' count (a critical section's address).
+        // wait, the objects' guest addresses (the first kWaitObjects of them; a critical section's address) and their
+        // count (a sleep's milliseconds).
+        static constexpr size_t kWaitObjects = 8;
         enum class WaitKind : uint8_t
         {
             kNone,
@@ -88,7 +90,8 @@ namespace kernel
             kSuspended,       // suspended by itself, until another thread resumes it
         };
         std::atomic<WaitKind> waitKind{ WaitKind::kNone };
-        std::atomic<uint32_t> waitObject{ 0 }, waitCount{ 0 };
+        std::array<std::atomic<uint32_t>, kWaitObjects> waitObjects{};
+        std::atomic<uint32_t> waitCount{ 0 };
 
         // Per-thread kernel state used by exports.
         std::array<uint32_t, kTlsSlotCount> tls{};

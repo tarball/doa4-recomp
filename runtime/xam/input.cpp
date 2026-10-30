@@ -10,7 +10,8 @@
 // testing): from the start time on, they are held for 100 ms every period (default 2000 ms), `count`
 // times (default: forever). INPUT_SCRIPT=<ms>:<buttons hex>[,<ms>:<buttons hex>...] also presses
 // buttons for 100 ms at those times (on the same clock, from the first input poll), e.g. to move the
-// cursor in a menu: D-pad up 1, down 2, left 4, right 8, Start 10, A 1000, B 2000. With INPUT_FRAMES=1 both count game
+// cursor in a menu: D-pad up 1, down 2, left 4, right 8, Start 10, A 1000, B 2000. A press written
+// <ms>:<buttons hex>@<lx>,<ly> also deflects the left stick that far (-32768 to 32767). With INPUT_FRAMES=1 both count game
 // frames (netplay::Frame, where the game's main loop starts each frame) instead of milliseconds, and presses last 6 frames.
 // A press written F<frame>:<buttons hex> counts the fight's frames instead (netplay::FightFrame, from its first frame past
 // loading, which takes each run its own time) and lasts 6 frames, and one written S<screen>.<frame>:<buttons hex> the
@@ -142,6 +143,7 @@ namespace
             uint32_t screen = 0;
             long long time = 0;
             WORD buttons = 0;
+            SHORT lx = 0, ly = 0; // the left stick, if deflected (@lx,ly)
         };
         std::vector<Press> presses;
         std::vector<uint8_t> logged; // each press is logged as it starts
@@ -168,6 +170,12 @@ namespace
                 if (*end != ':')
                     break;
                 press.buttons = WORD(strtoul(end + 1, &end, 16));
+                if (*end == '@')
+                {
+                    press.lx = SHORT(std::clamp(strtol(end + 1, &end, 10), -32768l, 32767l));
+                    if (*end == ',')
+                        press.ly = SHORT(std::clamp(strtol(end + 1, &end, 10), -32768l, 32767l));
+                }
                 presses.push_back(press);
                 p = *end ? end + 1 : end;
             }
@@ -294,6 +302,11 @@ namespace
             if (at >= press.time && at < press.time + length)
             {
                 pad.wButtons |= press.buttons;
+                if (press.lx || press.ly)
+                {
+                    pad.sThumbLX = press.lx;
+                    pad.sThumbLY = press.ly;
+                }
                 active = true;
                 if (!script.logged[i])
                 {
@@ -323,9 +336,11 @@ namespace
             state = XINPUT_STATE{};
         // Packet numbers must change whenever the state does.
         static std::atomic<DWORD> virtualPacket[2]{};
-        static std::atomic<WORD> lastButtons[2]{};
+        static std::atomic<uint64_t> lastState[2]{}; // buttons and left stick
         ApplyVirtualInput(user, state.Gamepad);
-        if (state.Gamepad.wButtons != lastButtons[user].exchange(state.Gamepad.wButtons))
+        const uint64_t current = state.Gamepad.wButtons | (uint64_t(uint16_t(state.Gamepad.sThumbLX)) << 16) |
+                                 (uint64_t(uint16_t(state.Gamepad.sThumbLY)) << 32);
+        if (current != lastState[user].exchange(current))
             virtualPacket[user]++;
         state.dwPacketNumber += virtualPacket[user].load();
         return true;

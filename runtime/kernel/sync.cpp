@@ -1,12 +1,18 @@
-// Synchronization exports: events, waits, critical sections, spinlocks/IRQL, TLS and handles.
+// Synchronization exports: events, semaphores, timers, waits, critical sections, spinlocks/IRQL, TLS and handles.
 #include "guest_abi.h"
 #include "kernel/objects.h"
 #include "kernel/status.h"
 #include "kernel/threads.h"
 #include "log.h"
 
+#include <algorithm>
 #include <atomic>
 #include <bitset>
+#include <chrono>
+#include <condition_variable>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -105,6 +111,238 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------
+    // Semaphores (KSEMAPHORE: the header's signal state is the count, then the limit). Waits take one each.
+
+    struct Semaphore
+    {
+        DispatcherHeader header;
+        be<int32_t> limit;
+    };
+    static_assert(sizeof(Semaphore) == 0x14);
+
+    constexpr uint32_t kSemaphoreLimitExceeded = 0xC0000047;
+
+    void InitializeSemaphore(Semaphore* semaphore, int32_t count, int32_t limit)
+    {
+        semaphore->header.type = uint8_t(DispatcherType::Semaphore);
+        semaphore->header.absolute = 0;
+        semaphore->header.size = sizeof(Semaphore) / 4;
+        semaphore->header.inserted = 0;
+        semaphore->header.signalState = count;
+        semaphore->header.waitListFlink = guest::ToGuest(&semaphore->header.waitListFlink);
+        semaphore->header.waitListBlink = guest::ToGuest(&semaphore->header.waitListFlink);
+        semaphore->limit = limit;
+    }
+
+    // Adds `adjustment` to the count and wakes waiters. Returns false (changing nothing) past the limit.
+    bool ReleaseSemaphore(Semaphore* semaphore, int32_t adjustment, int32_t& previous)
+    {
+        std::lock_guard lock(DispatcherLock());
+        previous = semaphore->header.signalState;
+        const int64_t count = int64_t(previous) + adjustment;
+        if (adjustment <= 0 || count > int32_t(semaphore->limit))
+            return false;
+        semaphore->header.signalState = int32_t(count);
+        SatisfyWaiters();
+        return true;
+    }
+
+    void KeInitializeSemaphore(Semaphore* semaphore, int32_t count, int32_t limit)
+    {
+        if (semaphore)
+            InitializeSemaphore(semaphore, count, limit);
+    }
+
+    int32_t KeReleaseSemaphore(Semaphore* semaphore, uint32_t /*increment*/, int32_t adjustment, uint32_t /*wait*/)
+    {
+        int32_t previous = 0;
+        if (!semaphore || !ReleaseSemaphore(semaphore, adjustment, previous))
+            LOG_WARN("KeReleaseSemaphore(%08X, %d): limit exceeded (count %d)", guest::ToGuest(semaphore), adjustment, previous);
+        return previous;
+    }
+
+    class SemaphoreObject : public GuestBackedObject
+    {
+    public:
+        SemaphoreObject(int32_t count, int32_t limit) : GuestBackedObject(sizeof(Semaphore))
+        {
+            InitializeSemaphore(guest::Translate<Semaphore>(GuestObject()), count, limit);
+        }
+        const char* TypeName() const override { return "Semaphore"; }
+    };
+
+    uint32_t NtCreateSemaphore(be<uint32_t>* handle, uint32_t /*objectAttributes*/, int32_t initialCount, int32_t maximumCount)
+    {
+        if (!handle || maximumCount <= 0 || initialCount < 0 || initialCount > maximumCount)
+            return status::kInvalidParameter;
+        auto semaphore = std::make_shared<SemaphoreObject>(initialCount, maximumCount);
+        RegisterGuestObject(semaphore);
+        *handle = CreateHandle(semaphore);
+        return status::kSuccess;
+    }
+
+    uint32_t NtReleaseSemaphore(uint32_t handle, int32_t releaseCount, be<int32_t>* previousCount)
+    {
+        auto semaphore = LookupHandleAs<SemaphoreObject>(handle);
+        if (!semaphore)
+            return status::kInvalidHandle;
+        int32_t previous = 0;
+        if (!ReleaseSemaphore(guest::Translate<Semaphore>(semaphore->GuestObject()), releaseCount, previous))
+            return kSemaphoreLimitExceeded;
+        if (previousCount)
+            *previousCount = previous;
+        return status::kSuccess;
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // Timers (KTIMER: a dispatcher header, the due time, a list entry, a DPC and the period). A host thread signals each
+    // one when it's due, and again every period for periodic ones. Completion routines (APCs) aren't run: DOAX2's network
+    // library (its only user) waits on its timer instead.
+
+    constexpr uint32_t kTimerSize = 0x28;
+    constexpr uint32_t kTimerResumeIgnored = 0x40000025; // STATUS_TIMER_RESUME_IGNORED
+
+    class Timer : public GuestBackedObject
+    {
+    public:
+        explicit Timer(DispatcherType type) : GuestBackedObject(kTimerSize)
+        {
+            Header()->type = uint8_t(type);
+            Header()->size = kTimerSize / 4;
+        }
+        const char* TypeName() const override { return "Timer"; }
+
+        // Under g_timerLock. `generation` changes whenever the timer is set or cancelled, which retires its earlier
+        // entries in the schedule.
+        uint64_t generation = 0;
+        bool armed = false;
+        std::chrono::steady_clock::duration period{};
+    };
+
+    using TimerClock = std::chrono::steady_clock;
+
+    // Lock order: g_timerLock, then the dispatcher's.
+    std::mutex g_timerLock;
+    std::condition_variable g_timerWake;
+    std::multimap<TimerClock::time_point, std::pair<std::weak_ptr<Timer>, uint64_t>> g_timerSchedule; // due -> timer, generation
+
+    void TimerThread()
+    {
+        std::unique_lock lock(g_timerLock);
+        for (;;)
+        {
+            if (g_timerSchedule.empty())
+            {
+                g_timerWake.wait(lock);
+                continue;
+            }
+            const auto due = g_timerSchedule.begin()->first;
+            if (TimerClock::now() < due)
+            {
+                g_timerWake.wait_until(lock, due);
+                continue;
+            }
+            const auto [weakTimer, generation] = g_timerSchedule.begin()->second;
+            g_timerSchedule.erase(g_timerSchedule.begin());
+            const auto timer = weakTimer.lock();
+            if (!timer || !timer->armed || timer->generation != generation)
+                continue;
+            if (timer->period.count() > 0)
+            {
+                // The next period, or one from now if the timer fell behind (no bursts of catching up).
+                const auto now = TimerClock::now();
+                const auto next = due + timer->period > now ? due + timer->period : now + timer->period;
+                g_timerSchedule.emplace(next, std::make_pair(weakTimer, generation));
+            }
+            else
+            {
+                timer->armed = false;
+            }
+            kernel::SignalHeader(timer->GuestObject(), 1);
+        }
+    }
+
+    // NtCreateTimer(&handle, attributes, type): a notification timer (0) stays signaled until it's set again; a
+    // synchronization timer (1) releases one waiter.
+    uint32_t NtCreateTimer(be<uint32_t>* handle, uint32_t /*objectAttributes*/, uint32_t timerType)
+    {
+        if (!handle || timerType > 1)
+            return status::kInvalidParameter;
+        auto timer = std::make_shared<Timer>(timerType == 0 ? DispatcherType::NotificationTimer : DispatcherType::SynchronizationTimer);
+        RegisterGuestObject(timer);
+        *handle = CreateHandle(timer);
+        return status::kSuccess;
+    }
+
+    // NtSetTimerEx(timer, &due time, completion routine, its mode, its context, resume, period in ms, &previous state):
+    // unsignals the timer and schedules it. The due time is relative when negative (100 ns units), else a system time.
+    uint32_t NtSetTimerEx(uint32_t handle, const be<int64_t>* dueTime, uint32_t completionRoutine, uint32_t /*mode*/, uint32_t /*context*/,
+        uint32_t resume, int32_t periodMs, uint8_t* previousState)
+    {
+        auto timer = LookupHandleAs<Timer>(handle);
+        if (!timer)
+            return status::kInvalidHandle;
+        if (!dueTime || periodMs < 0)
+            return status::kInvalidParameter;
+        if (completionRoutine)
+        {
+            static std::once_flag warned;
+            std::call_once(warned, [completionRoutine] { LOG_WARN("NtSetTimerEx: completion routines (0x%08X) aren't run", completionRoutine); });
+        }
+
+        constexpr uint64_t kMaxTicks = 365ull * 24 * 3600 * 10'000'000; // a year
+        const int64_t value = *dueTime;
+        uint64_t ticks = 0;
+        if (value < 0)
+        {
+            ticks = 0 - uint64_t(value);
+        }
+        else
+        {
+            FILETIME now;
+            GetSystemTimeAsFileTime(&now);
+            const uint64_t systemTime = (uint64_t(now.dwHighDateTime) << 32) | now.dwLowDateTime;
+            ticks = uint64_t(value) > systemTime ? uint64_t(value) - systemTime : 0;
+        }
+        const auto due = TimerClock::now() + std::chrono::duration_cast<TimerClock::duration>(std::chrono::nanoseconds(std::min(ticks, kMaxTicks) * 100));
+
+        static std::once_flag started;
+        std::call_once(started, [] { std::thread(TimerThread).detach(); });
+        {
+            std::lock_guard lock(g_timerLock);
+            {
+                std::lock_guard dispatcher(DispatcherLock());
+                if (previousState)
+                    *previousState = timer->Header()->signalState > 0 ? 1 : 0;
+                timer->Header()->signalState = 0;
+            }
+            timer->generation++;
+            timer->armed = true;
+            timer->period = std::chrono::milliseconds(periodMs);
+            g_timerSchedule.emplace(due, std::make_pair(std::weak_ptr<Timer>(timer), timer->generation));
+        }
+        g_timerWake.notify_one();
+        return resume ? kTimerResumeIgnored : status::kSuccess;
+    }
+
+    // NtCancelTimer(timer, &current state): unschedules it, leaving its state as it is.
+    uint32_t NtCancelTimer(uint32_t handle, uint8_t* currentState)
+    {
+        auto timer = LookupHandleAs<Timer>(handle);
+        if (!timer)
+            return status::kInvalidHandle;
+        std::lock_guard lock(g_timerLock);
+        timer->generation++;
+        timer->armed = false;
+        if (currentState)
+        {
+            std::lock_guard dispatcher(DispatcherLock());
+            *currentState = timer->Header()->signalState > 0 ? 1 : 0;
+        }
+        return status::kSuccess;
+    }
+
+    // ---------------------------------------------------------------------------------------------
     // Waits
 
     uint32_t KeWaitForSingleObject(uint32_t object, uint32_t /*waitReason*/, uint32_t /*processorMode*/, uint32_t /*alertable*/, const be<int64_t>* timeout)
@@ -113,6 +351,23 @@ namespace
             return status::kInvalidParameter;
         const uint32_t headers[] = { object };
         return WaitForHeaders(headers, false, timeout);
+    }
+
+    // KeWaitForMultipleObjects(count, objects, waitType, waitReason, mode, alertable, timeout, waitBlocks): the objects
+    // are dispatcher headers. WaitType: 0 = WaitAll, 1 = WaitAny.
+    uint32_t KeWaitForMultipleObjects(uint32_t count, const be<uint32_t>* objects, uint32_t waitType, uint32_t /*waitReason*/,
+        uint32_t /*processorMode*/, uint32_t /*alertable*/, const be<int64_t>* timeout, uint32_t /*waitBlocks*/)
+    {
+        if (!objects || count == 0 || count > 64)
+            return status::kInvalidParameter;
+        std::vector<uint32_t> headers(count);
+        for (uint32_t i = 0; i < count; i++)
+        {
+            headers[i] = objects[i];
+            if (!headers[i])
+                return status::kInvalidParameter;
+        }
+        return WaitForHeaders(headers, waitType == 0, timeout);
     }
 
     uint32_t NtWaitForSingleObjectEx(uint32_t handle, uint32_t /*waitMode*/, uint32_t /*alertable*/, const be<int64_t>* timeout)
@@ -215,7 +470,7 @@ namespace
             GuestThread* thread = CurrentThread();
             if (thread)
             {
-                thread->waitObject.store(headers[0], std::memory_order_relaxed);
+                thread->waitObjects[0].store(headers[0], std::memory_order_relaxed);
                 thread->waitCount.store(1, std::memory_order_relaxed);
                 thread->waitKind.store(GuestThread::WaitKind::kCriticalSection, std::memory_order_release);
             }
@@ -411,15 +666,11 @@ namespace
 
     uint32_t ObReferenceObjectByHandle(uint32_t handle, uint32_t /*objectType*/, be<uint32_t>* object)
     {
-        auto target = LookupHandle(handle);
-        if (!target || !target->GuestObject())
+        const uint32_t guestObject = kernel::ReferenceObject(handle);
+        if (!guestObject)
             return status::kInvalidHandle;
-        {
-            std::lock_guard lock(g_referenceLock);
-            g_references.emplace(target->GuestObject(), target);
-        }
         if (object)
-            *object = target->GuestObject();
+            *object = guestObject;
         return status::kSuccess;
     }
 
@@ -436,13 +687,34 @@ namespace
     }
 }
 
+namespace kernel
+{
+    uint32_t ReferenceObject(uint32_t handle)
+    {
+        auto target = LookupHandle(handle);
+        if (!target || !target->GuestObject())
+            return 0;
+        std::lock_guard lock(g_referenceLock);
+        g_references.emplace(target->GuestObject(), target);
+        return target->GuestObject();
+    }
+}
+
 GUEST_EXPORT(NtCreateEvent, NtCreateEvent)
 GUEST_EXPORT(NtSetEvent, NtSetEvent)
 GUEST_EXPORT(NtPulseEvent, NtPulseEvent)
 GUEST_EXPORT(NtClearEvent, NtClearEvent)
 GUEST_EXPORT(KeSetEvent, KeSetEvent)
 GUEST_EXPORT(KeResetEvent, KeResetEvent)
+GUEST_EXPORT(KeInitializeSemaphore, KeInitializeSemaphore)
+GUEST_EXPORT(KeReleaseSemaphore, KeReleaseSemaphore)
+GUEST_EXPORT(NtCreateSemaphore, NtCreateSemaphore)
+GUEST_EXPORT(NtReleaseSemaphore, NtReleaseSemaphore)
+GUEST_EXPORT(NtCreateTimer, NtCreateTimer)
+GUEST_EXPORT(NtSetTimerEx, NtSetTimerEx)
+GUEST_EXPORT(NtCancelTimer, NtCancelTimer)
 GUEST_EXPORT(KeWaitForSingleObject, KeWaitForSingleObject)
+GUEST_EXPORT(KeWaitForMultipleObjects, KeWaitForMultipleObjects)
 GUEST_EXPORT(NtWaitForSingleObjectEx, NtWaitForSingleObjectEx)
 GUEST_EXPORT(NtWaitForMultipleObjectsEx, NtWaitForMultipleObjectsEx)
 GUEST_EXPORT(NtSignalAndWaitForSingleObjectEx, NtSignalAndWaitForSingleObjectEx)

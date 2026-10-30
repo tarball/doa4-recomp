@@ -41,6 +41,13 @@ namespace vfs
         virtual std::vector<EntryInfo> List() const { return {}; }
         // Marks the file to be deleted when closed.
         virtual uint32_t SetDeleteOnClose() = 0;
+        // Sets the file's times (FILETIME values; 0 leaves one as it is). Devices that don't keep them ignore this.
+        virtual uint32_t SetTimes(uint64_t /*creation*/, uint64_t /*access*/, uint64_t /*write*/, uint64_t /*change*/) { return 0; }
+        // NtDeviceIoControlFile on the file (raw partitions answer the disk queries). Returns NTSTATUS.
+        virtual uint32_t IoControl(uint32_t /*code*/, void* /*output*/, uint32_t /*outputLength*/, uint32_t& /*returned*/)
+        {
+            return 0xC0000010; // STATUS_INVALID_DEVICE_REQUEST
+        }
     };
 
     // CreateDisposition values.
@@ -70,6 +77,9 @@ namespace vfs
         bool directory = false;    // FILE_DIRECTORY_FILE
         bool nonDirectory = false; // FILE_NON_DIRECTORY_FILE
         bool write = false;
+        // The device itself, named without a trailing backslash (\Device\Harddisk0\Cache0 rather than ...\Cache0\):
+        // on the 360 that's the raw partition, not its file system's root. Devices without a raw view open the root.
+        bool raw = false;
     };
 
     class Device
@@ -84,6 +94,8 @@ namespace vfs
         virtual uint64_t TotalBytes() const = 0;
         virtual uint64_t FreeBytes() const = 0;
         virtual const char* FileSystemName() const = 0;
+        // The file system's allocation unit, as FileFsSizeInformation reports it.
+        virtual uint32_t BytesPerCluster() const { return 0x4000; }
     };
 
     // Mounts a device at an absolute guest path such as "\Device\Cdrom0".

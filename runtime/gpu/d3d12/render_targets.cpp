@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 
@@ -134,39 +135,9 @@ uint XeScaledAddress(uint address, uint2 sub, uint log_bpp)
     return (((entry - 1u) << 12u) + (address & 4095u)) * scale * scale + ((sub.y * scale + sub.x) << log_bpp);
 }
 
-// k_5_6_5: a thread for each pair of pixels sharing a 32-bit word (the even one in its low half, after the endian
-// swap), so the word is written whole; a pixel of the pair outside the rectangle keeps what's there. No scaled copy.
-void XeResolve16(uint2 id)
-{
-    uint first = xe_dest_origin.x & ~1u;
-    uint pairs = ((xe_dest_origin.x + xe_size.x + 1u) >> 1u) - (first >> 1u);
-    if (id.x >= pairs || id.y >= xe_size.y)
-        return;
-    uint2 d = uint2(first + id.x * 2u, xe_dest_origin.y + id.y);
-    uint address = xe_dest_base + XeTiledOffset2D(d.x, d.y, xe_dest_pitch, 1u);
-    uint word = XeSwap(xe_dest.Load(address), xe_dest_endian);
-    for (uint i = 0u; i < 2u; i++)
-    {
-        uint x = d.x + i;
-        if (x < xe_dest_origin.x || x >= xe_dest_origin.x + xe_size.x)
-            continue;
-        float4 c = XeLoadSource(int2(xe_source_origin + uint2(x - xe_dest_origin.x, id.y))) * xe_scale;
-        if (xe_swap_red_blue != 0u)
-            c = c.zyxw;
-        uint pixel = XeUnorm(c.x, 31.0) | (XeUnorm(c.y, 63.0) << 5u) | (XeUnorm(c.z, 31.0) << 11u);
-        word = (word & ~(0xFFFFu << (i * 16u))) | (pixel << (i * 16u));
-    }
-    xe_dest.Store(address, XeSwap(word, xe_dest_endian));
-}
-
 [numthreads(8, 8, 1)]
 void main(uint3 id : SV_DispatchThreadID)
 {
-    if (xe_dest_format == 4u)
-    {
-        XeResolve16(id.xy);
-        return;
-    }
     uint scale = xe_resolution_scale;
     bool scaled = xe_scaled_pass != 0u;
     if (any(id.xy >= (scaled ? xe_size * scale : xe_size)))
@@ -187,6 +158,14 @@ void main(uint3 id : SV_DispatchThreadID)
         c = c.zyxw;
     switch (xe_dest_format)
     {
+    case 2u: // k_8: alpha (DOAX2's 8-bit targets are D3D's A8, drawn with the value in alpha and sampled as 000X)
+        packed.x = XeUnorm(c.w, 255.0);
+        log_bpp = 0u;
+        break;
+    case 4u: // k_5_6_5 (X in the low bits, as textures load it)
+        packed.x = XeUnorm(c.x, 31.0) | (XeUnorm(c.y, 63.0) << 5u) | (XeUnorm(c.z, 31.0) << 11u);
+        log_bpp = 1u;
+        break;
     case 6u: // k_8_8_8_8
     case 62u:
         packed.x = XeUnorm(c.x, 255.0) | (XeUnorm(c.y, 255.0) << 8u) | (XeUnorm(c.z, 255.0) << 16u) | (XeUnorm(c.w, 255.0) << 24u);
@@ -220,6 +199,16 @@ void main(uint3 id : SV_DispatchThreadID)
     }
     }
     uint address = xe_dest_base + XeTiledOffset2D(d.x, d.y, xe_dest_pitch, log_bpp);
+    if (log_bpp < 2u)
+    {
+        // A texel smaller than a dword, merged into the dword other pixels' threads write too: placed in the dword as
+        // textures read it (the swap applied), with its mask. (Resolves to 8- and 16-bit formats have no scaled copy.)
+        uint shift = (address & (log_bpp == 0u ? 3u : 2u)) << 3u;
+        uint mask = XeSwap((log_bpp == 0u ? 0xFFu : 0xFFFFu) << shift, xe_dest_endian);
+        xe_dest.InterlockedAnd(address & ~3u, ~mask);
+        xe_dest.InterlockedOr(address & ~3u, XeSwap(packed.x << shift, xe_dest_endian));
+        return;
+    }
     uint2 words = uint2(XeSwap(packed.x, xe_dest_endian), 0u);
     if (log_bpp == 3u)
     {
@@ -259,6 +248,305 @@ void main(uint3 id : SV_DispatchThreadID)
             uint32_t resolutionScale;
             uint32_t scaledPass;
         };
+
+        // EDRAM transfers (see render_targets.h): a triangle over the destination, each of its samples (host pixels,
+        // with resolution scaling) taking the source's sample at the same place in EDRAM. A tile holds 80x16 samples
+        // (40x16 of 64 bits); a pixel's samples are 1x2 with 2x MSAA, 2x2 with 4x. Between formats, a sample goes through
+        // the 32-bit word EDRAM holds (mode 1): 8-bit and 10-bit channels from the low bits up, 16-bit ones low half
+        // first, depth in the high 24 bits above an 8-bit stencil. Compiled with XE_SOURCE_MSAA for a multisampled source,
+        // XE_DEPTH for a depth destination, and XE_STENCIL to write the stencil too (SV_StencilRef). Where pixel shaders
+        // can't write it, XE_STENCIL_BIT makes the passes that set the stencil a bit at a time: each writes only bit
+        // xe_stencil_bit, and discards the samples whose source stencil has it clear.
+        const char kTransferVertexShader[] = R"(
+float4 main(uint id : SV_VertexID) : SV_Position
+{
+    return float4(float2((id << 1u) & 2u, id & 2u) * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);
+}
+)";
+
+        const char kTransferPixelShader[] = R"(
+cbuffer XeTransferConstants : register(b0)
+{
+    uint xe_dest_base;          // tiles
+    uint xe_dest_pitch_tiles;
+    uint xe_dest_log2_samples;  // the guest's
+    uint xe_dest_sample_ratio;  // host samples per guest sample
+    uint xe_source_base;
+    uint xe_source_pitch_tiles;
+    uint xe_source_log2_samples;
+    uint xe_source_sample_ratio;
+    uint xe_tile_samples_x;     // 80, or 40 for 64-bit samples
+    uint xe_scale;              // resolution scale
+    uint xe_mode;               // 0: the same format, values as they are; 1: through EDRAM's 32-bit words
+    uint xe_source_format;      // mode 1: RawFormat's codes
+    uint xe_dest_format;
+    uint xe_stencil_bit;        // XE_STENCIL_BIT
+};
+cbuffer XeTransferMask : register(b1)
+{
+    uint4 xe_mask[16]; // a bit per EDRAM tile: those to copy
+};
+#ifdef XE_SOURCE_MSAA
+Texture2DMS<float4> xe_source : register(t0);
+Texture2DMS<uint2> xe_source_stencil : register(t1);
+#else
+Texture2D<float4> xe_source : register(t0);
+Texture2D<uint2> xe_source_stencil : register(t1);
+#endif
+
+uint XeUnorm(float v, float scale)
+{
+    return uint(saturate(v) * scale + 0.5);
+}
+
+uint XeSnorm16(float v)
+{
+    return uint(int(round(clamp(v, -1.0, 1.0) * 32767.0))) & 0xFFFFu;
+}
+
+// Float depth: Xenos 20e4 (4-bit exponent, 20-bit mantissa), rounded to nearest even, and back.
+uint XeFloat32To20e4(float f)
+{
+    uint u = asuint(f);
+    if (int(u) <= 0)
+        return 0u;
+    u = min(u, 0x3FFFFFF8u);
+    if (u < 0x38800000u)
+        u = (0x800000u | (u & 0x7FFFFFu)) >> min(113u - (u >> 23u), 24u);
+    else
+        u += 0xC8000000u;
+    u += 3u + ((u >> 3u) & 1u);
+    return (u >> 3u) & 0xFFFFFFu;
+}
+
+float XeFloat20e4To32(uint f)
+{
+    uint exponent = (f >> 20u) & 0xFu, mantissa = f & 0xFFFFFu;
+    if (exponent == 0u)
+        return float(mantissa) * exp2(-34.0);
+    return (1.0 + float(mantissa) * exp2(-20.0)) * exp2(float(exponent) - 15.0);
+}
+
+// A sample as EDRAM holds it.
+uint XeWord(float4 value, uint stencil)
+{
+    switch (xe_source_format)
+    {
+    case 0u:
+        return XeUnorm(value.x, 255.0) | (XeUnorm(value.y, 255.0) << 8u) | (XeUnorm(value.z, 255.0) << 16u) | (XeUnorm(value.w, 255.0) << 24u);
+    case 1u:
+        return XeUnorm(value.x, 1023.0) | (XeUnorm(value.y, 1023.0) << 10u) | (XeUnorm(value.z, 1023.0) << 20u) | (XeUnorm(value.w, 3.0) << 30u);
+    case 2u:
+        return XeSnorm16(value.x) | (XeSnorm16(value.y) << 16u);
+    case 3u:
+        return f32tof16(value.x) | (f32tof16(value.y) << 16u);
+    case 4u:
+        return asuint(value.x);
+    case 8u:
+        return (XeUnorm(value.x, 16777215.0) << 8u) | (stencil & 0xFFu);
+    default:
+        return (XeFloat32To20e4(value.x) << 8u) | (stencil & 0xFFu);
+    }
+}
+
+float XeSnorm16ToFloat(uint v)
+{
+    return max(float(int(v << 16u) >> 16) / 32767.0, -1.0);
+}
+
+float4 XeColorFromWord(uint w)
+{
+    switch (xe_dest_format)
+    {
+    case 0u:
+        return float4(w & 0xFFu, (w >> 8u) & 0xFFu, (w >> 16u) & 0xFFu, w >> 24u) / 255.0;
+    case 1u:
+        return float4(w & 0x3FFu, (w >> 10u) & 0x3FFu, (w >> 20u) & 0x3FFu, w >> 30u) / float4(1023.0, 1023.0, 1023.0, 3.0);
+    case 2u:
+        return float4(XeSnorm16ToFloat(w & 0xFFFFu), XeSnorm16ToFloat(w >> 16u), 0.0, 0.0);
+    case 3u:
+        return float4(f16tof32(w & 0xFFFFu), f16tof32(w >> 16u), 0.0, 0.0);
+    default:
+        return float4(asfloat(w), 0.0, 0.0, 0.0);
+    }
+}
+
+struct XeOutput
+{
+#ifdef XE_DEPTH
+    float depth : SV_Depth;
+#ifdef XE_STENCIL
+    uint stencil : SV_StencilRef;
+#endif
+#else
+    float4 color : SV_Target0;
+#endif
+};
+
+#ifdef XE_STENCIL_BIT
+void main(float4 position : SV_Position, uint host_sample : SV_SampleIndex)
+#else
+XeOutput main(float4 position : SV_Position, uint host_sample : SV_SampleIndex)
+#endif
+{
+    uint2 host = uint2(position.xy);
+    uint2 pixel = host / xe_scale, sub = host % xe_scale;
+    uint sample = host_sample / xe_dest_sample_ratio;
+    // This sample's tile in the destination, and its place in the tile.
+    uint tile_width = xe_dest_log2_samples == 2u ? xe_tile_samples_x >> 1u : xe_tile_samples_x;
+    uint2 tile = uint2(pixel.x / tile_width, pixel.y >> (xe_dest_log2_samples == 0u ? 4u : 3u));
+    uint2 in_tile;
+    if (xe_dest_log2_samples == 0u)
+        in_tile = uint2(pixel.x % tile_width, pixel.y & 15u);
+    else if (xe_dest_log2_samples == 1u)
+        in_tile = uint2(pixel.x % tile_width, ((pixel.y & 7u) << 1u) | (sample & 1u));
+    else
+        in_tile = uint2(((pixel.x % tile_width) << 1u) | (sample & 1u), ((pixel.y & 7u) << 1u) | ((sample >> 1u) & 1u));
+    uint index = xe_dest_base + tile.y * xe_dest_pitch_tiles + tile.x;
+    if (tile.x >= xe_dest_pitch_tiles || index >= 2048u || (xe_mask[index >> 7u][(index >> 5u) & 3u] & (1u << (index & 31u))) == 0u)
+        discard;
+    // The same place in the source.
+    uint offset = index - xe_source_base;
+    uint2 source_tile = uint2(offset % xe_source_pitch_tiles, offset / xe_source_pitch_tiles);
+    uint2 source_pixel;
+    uint source_sample;
+    if (xe_source_log2_samples == 0u)
+    {
+        source_pixel = source_tile * uint2(xe_tile_samples_x, 16u) + in_tile;
+        source_sample = 0u;
+    }
+    else if (xe_source_log2_samples == 1u)
+    {
+        source_pixel = source_tile * uint2(xe_tile_samples_x, 8u) + uint2(in_tile.x, in_tile.y >> 1u);
+        source_sample = in_tile.y & 1u;
+    }
+    else
+    {
+        source_pixel = source_tile * uint2(xe_tile_samples_x >> 1u, 8u) + (in_tile >> 1u);
+        source_sample = (in_tile.x & 1u) | ((in_tile.y & 1u) << 1u);
+    }
+    int2 p = int2(source_pixel * xe_scale + sub);
+    uint s = source_sample * xe_source_sample_ratio;
+#ifdef XE_SOURCE_MSAA
+    float4 value = xe_source.Load(p, s);
+#else
+    float4 value = xe_source.Load(int3(p, 0));
+#endif
+    // The source's stencil (depth sources: the same format into depth, or words from depth).
+    uint stencil = 0u;
+#ifdef XE_DEPTH
+    if (xe_mode == 0u || xe_source_format >= 8u)
+#else
+    if (xe_mode != 0u && xe_source_format >= 8u)
+#endif
+    {
+#ifdef XE_SOURCE_MSAA
+        stencil = xe_source_stencil.Load(p, s).y;
+#else
+        stencil = xe_source_stencil.Load(int3(p, 0)).y;
+#endif
+    }
+#ifdef XE_STENCIL_BIT
+    if (((xe_mode == 0u ? stencil : XeWord(value, stencil)) & (1u << xe_stencil_bit)) == 0u)
+        discard;
+#else
+    XeOutput output;
+    if (xe_mode == 0u)
+    {
+#ifdef XE_DEPTH
+        output.depth = value.x;
+#ifdef XE_STENCIL
+        output.stencil = stencil;
+#endif
+#else
+        output.color = value;
+#endif
+    }
+    else
+    {
+        uint word = XeWord(value, stencil);
+#ifdef XE_DEPTH
+        output.depth = xe_dest_format == 8u ? float(word >> 8u) / 16777215.0 : XeFloat20e4To32(word >> 8u);
+#ifdef XE_STENCIL
+        output.stencil = word & 0xFFu;
+#endif
+#else
+        output.color = XeColorFromWord(word);
+#endif
+    }
+    return output;
+#endif
+}
+)";
+
+        struct TransferConstants
+        {
+            uint32_t destBase, destPitchTiles, destLog2Samples, destSampleRatio;
+            uint32_t sourceBase, sourcePitchTiles, sourceLog2Samples, sourceSampleRatio;
+            uint32_t tileSamplesX;
+            uint32_t scale;
+            uint32_t mode, sourceFormat, destFormat;
+            uint32_t stencilBit;
+        };
+
+        // A target's EDRAM tiles: their size in pixels, and how many make a row of the surface.
+        struct TileLayout
+        {
+            uint32_t width, height, pitchTiles;
+        };
+
+        TileLayout LayoutOf(const RenderTargetCache::Target& target)
+        {
+            const uint32_t samplesX = !target.depth && xenos::Is64bpp(xenos::ColorFormat(target.format)) ? 40 : 80;
+            const uint32_t width = target.samples >= 4 ? samplesX / 2 : samplesX;
+            const uint32_t height = target.samples >= 2 ? 8 : 16;
+            return { width, height, (target.pitch + width - 1) / width };
+        }
+
+        // A target's samples as EDRAM words, for transfers between formats (the shader's codes): 0 8_8_8_8, 1
+        // 2_10_10_10, 2 16_16 (fixed), 3 16_16 float, 4 32 float, 8 24-bit depth, 9 20e4 float depth. UINT32_MAX for
+        // 64-bit formats and 2_10_10_10_FLOAT, which the host keeps in 16-bit floats.
+        uint32_t RawFormat(const RenderTargetCache::Target& target)
+        {
+            if (target.depth)
+                return xenos::DepthFormat(target.format) == xenos::DepthFormat::kD24FS8 ? 9 : 8;
+            switch (xenos::ColorFormat(target.format))
+            {
+            case xenos::ColorFormat::k_8_8_8_8:
+            case xenos::ColorFormat::k_8_8_8_8_GAMMA:
+                return 0;
+            case xenos::ColorFormat::k_2_10_10_10:
+            case xenos::ColorFormat::k_2_10_10_10_AS_10_10_10_10:
+                return 1;
+            case xenos::ColorFormat::k_16_16:
+                return 2;
+            case xenos::ColorFormat::k_16_16_FLOAT:
+                return 3;
+            case xenos::ColorFormat::k_32_FLOAT:
+                return 4;
+            default:
+                return UINT32_MAX;
+            }
+        }
+
+        // How one target's EDRAM contents come into another: values as they are (the same format), through EDRAM's
+        // words (other 32-bit formats, color or depth: DOAX2 clears a color buffer with a depth clear of the same
+        // EDRAM), or not at all (the gamma format's views encode on write, and 64-bit samples between formats).
+        enum class TransferMode
+        {
+            kNone,
+            kDirect,
+            kRaw,
+        };
+
+        TransferMode ModeOf(const RenderTargetCache::Target& source, const RenderTargetCache::Target& dest)
+        {
+            if (dest.viewFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB)
+                return TransferMode::kNone;
+            if (source.depth == dest.depth && source.format == dest.format)
+                return TransferMode::kDirect;
+            return RawFormat(source) != UINT32_MAX && RawFormat(dest) != UINT32_MAX ? TransferMode::kRaw : TransferMode::kNone;
+        }
 
         uint32_t SwapForEndian(uint32_t value, uint32_t endian)
         {
@@ -367,6 +655,37 @@ void main(uint3 id : SV_DispatchThreadID)
                 return false;
             }
         }
+
+        // EDRAM transfers: constants, the tile mask (CBV), the source and its stencil (tables).
+        D3D12_DESCRIPTOR_RANGE sourceRanges[2] = { { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0 }, { D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 1, 0, 0 } };
+        D3D12_ROOT_PARAMETER transferParameters[4]{};
+        transferParameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        transferParameters[0].Constants = { 0, 0, sizeof(TransferConstants) / 4 };
+        transferParameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+        transferParameters[1].Descriptor = { 1, 0 };
+        for (int i = 0; i < 2; i++)
+        {
+            transferParameters[2 + i].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+            transferParameters[2 + i].DescriptorTable = { 1, &sourceRanges[i] };
+        }
+        for (D3D12_ROOT_PARAMETER& parameter : transferParameters)
+            parameter.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+        const D3D12_ROOT_SIGNATURE_DESC transferDescription{ 4, transferParameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE };
+        if (FAILED(D3D12SerializeRootSignature(&transferDescription, D3D_ROOT_SIGNATURE_VERSION_1, &blob, &error)) ||
+            FAILED(device->CreateRootSignature(0, blob->GetBufferPointer(), blob->GetBufferSize(), IID_PPV_ARGS(&m_transferRootSignature))) ||
+            !(m_transferVertexShader = CompileShader(kTransferVertexShader, "main", "vs_5_1", "EDRAM transfer")))
+        {
+            LOG_ERROR("D3D12: can't create the EDRAM transfer root signature");
+            return false;
+        }
+        D3D12_FEATURE_DATA_D3D12_OPTIONS options{};
+        const bool stencilRef = SUCCEEDED(device->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS, &options, sizeof(options))) &&
+                                options.PSSpecifiedStencilRefSupported;
+        m_stencilTransfer = stencilRef ? StencilTransfer::kShader : StencilTransfer::kBits;
+        if (const char* setting = std::getenv(GAME_PREFIX "_DEBUG_STENCIL_TRANSFER"))
+            m_stencilTransfer = std::atoi(setting) == 0 ? StencilTransfer::kNone : StencilTransfer::kBits;
+        LOG_INFO("D3D12: pixel shaders %s the stencil; EDRAM transfers into depth copy it %s", stencilRef ? "can write" : "can't write",
+            m_stencilTransfer == StencilTransfer::kShader ? "with the depth" : m_stencilTransfer == StencilTransfer::kBits ? "a bit at a time" : "not at all");
         return true;
     }
 
@@ -378,9 +697,13 @@ void main(uint3 id : SV_DispatchThreadID)
                 continue;
             (target->depth ? m_dsvs : m_rtvs).Free(target->view);
             m_views->FreePersistent(target->srv);
+            if (target->depth)
+                m_views->FreePersistent(target->stencilSrv);
         }
         m_targets.clear();
         m_bound = {};
+        m_owners.fill(nullptr);
+        m_ownerEpoch++;
     }
 
     RenderTargetCache::Target* RenderTargetCache::GetTarget(uint32_t base, uint32_t pitch, uint32_t samples, uint32_t format, bool depth)
@@ -480,6 +803,14 @@ void main(uint3 id : SV_DispatchThreadID)
         srv.Texture2D.MipLevels = 1;
         target->srv = m_views->AllocatePersistent(1);
         m_device->CreateShaderResourceView(target->resource.Get(), &srv, m_views->Cpu(target->srv));
+        if (depth)
+        {
+            srv.Format = srvFormat == DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS ? DXGI_FORMAT_X32_TYPELESS_G8X24_UINT : DXGI_FORMAT_X24_TYPELESS_G8_UINT;
+            if (target->hostSamples == 1)
+                srv.Texture2D.PlaneSlice = 1;
+            target->stencilSrv = m_views->AllocatePersistent(1);
+            m_device->CreateShaderResourceView(target->resource.Get(), &srv, m_views->Cpu(target->stencilSrv));
+        }
 
         LOG_INFO("GPU: render target at tile %u, pitch %u, %ux MSAA, format %u%s -> %ux%u%s", base, pitch, samples, format, depth ? " (depth)" : "",
             target->width * scale, target->height * scale, target->hostSamples != samples ? (" with " + std::to_string(target->hostSamples) + " samples").c_str() : "");
@@ -534,9 +865,34 @@ void main(uint3 id : SV_DispatchThreadID)
         return out.width != UINT32_MAX;
     }
 
-    void RenderTargetCache::Bind(ID3D12GraphicsCommandList* list, const Bindings& targets)
+    void RenderTargetCache::Bind(ID3D12GraphicsCommandList* list, UploadAllocator& upload, const Bindings& targets, uint32_t left, uint32_t top,
+        uint32_t right, uint32_t bottom)
     {
-        if (m_passActive && m_passList == list)
+        UseList(list);
+        // A surface's height isn't in the registers. With color and depth bound, each is at most the space between their
+        // bases (D3D places them back to back), which bounds draws in screen space.
+        if (targets.depth)
+        {
+            for (Target* color : targets.color)
+            {
+                if (!color || color->base == targets.depth->base)
+                    continue;
+                const uint32_t gap = color->base < targets.depth->base ? targets.depth->base - color->base : color->base - targets.depth->base;
+                for (const Target* target : { color, targets.depth })
+                {
+                    const TileLayout layout = LayoutOf(*target);
+                    bottom = std::min(bottom, gap / layout.pitchTiles * layout.height);
+                }
+            }
+        }
+        for (Target* target : targets.color)
+        {
+            if (target)
+                Acquire(list, upload, *target, left, top, right, bottom);
+        }
+        if (targets.depth)
+            Acquire(list, upload, *targets.depth, left, top, right, bottom);
+        if (m_passActive)
         {
             bool same = targets.depth == m_bound.depth;
             for (uint32_t i = 0; same && i < 4; i++)
@@ -545,12 +901,6 @@ void main(uint3 id : SV_DispatchThreadID)
                 return;
         }
         EndPass(list);
-        if (m_passList != list)
-        {
-            m_passList = list;
-            m_passList4.Reset();
-            list->QueryInterface(IID_PPV_ARGS(&m_passList4));
-        }
 
         D3D12_RENDER_PASS_RENDER_TARGET_DESC colors[4]{};
         uint32_t count = 0;
@@ -586,6 +936,255 @@ void main(uint3 id : SV_DispatchThreadID)
         m_passList4->BeginRenderPass(count, count ? colors : nullptr, targets.depth ? &depth : nullptr, D3D12_RENDER_PASS_FLAG_NONE);
         m_passActive = true;
         m_bound = targets;
+    }
+
+    void RenderTargetCache::Acquire(ID3D12GraphicsCommandList* list, UploadAllocator& upload, Target& target, uint32_t left, uint32_t top,
+        uint32_t right, uint32_t bottom)
+    {
+        if (right <= left || bottom <= top)
+            return;
+        const TileLayout layout = LayoutOf(target);
+        const uint32_t c0 = left / layout.width, c1 = std::min((right - 1) / layout.width, layout.pitchTiles - 1);
+        const uint32_t r0 = top / layout.height, r1 = (bottom - 1) / layout.height;
+        if (target.checkedEpoch == m_ownerEpoch && c0 >= target.checked[0] && c1 <= target.checked[1] && r0 >= target.checked[2] &&
+            r1 <= target.checked[3])
+            return;
+
+        // The tiles other targets hold, by holder.
+        std::vector<std::pair<Target*, std::array<uint32_t, 64>>> sources;
+        bool changed = false;
+        for (uint32_t row = r0; row <= r1; row++)
+        {
+            for (uint32_t column = c0; column <= c1; column++)
+            {
+                const uint32_t tile = target.base + row * layout.pitchTiles + column;
+                if (tile >= kEdramTiles)
+                    break;
+                Target* owner = m_owners[tile];
+                if (owner == &target)
+                    continue;
+                m_owners[tile] = &target;
+                changed = true;
+                if (!owner)
+                    continue;
+                auto it = std::find_if(sources.begin(), sources.end(), [owner](const auto& entry) { return entry.first == owner; });
+                if (it == sources.end())
+                    it = sources.insert(sources.end(), { owner, {} });
+                it->second[tile >> 5] |= 1u << (tile & 31);
+            }
+        }
+        // DEBUG_NO_EDRAM_TRANSFERS (diagnostics): 1, ownership is kept but contents aren't copied; 2, only between the
+        // same formats (not as EDRAM words).
+        static const int noTransfers = [] {
+            const char* setting = std::getenv(GAME_PREFIX "_DEBUG_NO_EDRAM_TRANSFERS");
+            return setting ? std::atoi(setting) : 0;
+        }();
+        for (const auto& [source, mask] : sources)
+        {
+            const uint64_t pair = (uint64_t(reinterpret_cast<uintptr_t>(source)) << 20) ^ reinterpret_cast<uintptr_t>(&target);
+            TransferMode mode = noTransfers == 1 ? TransferMode::kNone : ModeOf(*source, target);
+            if (noTransfers == 2 && mode == TransferMode::kRaw)
+                mode = TransferMode::kNone;
+            if (logTransfers)
+            {
+                uint32_t first = UINT32_MAX, last = 0, count = 0;
+                for (uint32_t tile = 0; tile < kEdramTiles; tile++)
+                {
+                    if (mask[tile >> 5] & (1u << (tile & 31)))
+                    {
+                        first = std::min(first, tile);
+                        last = tile;
+                        count++;
+                    }
+                }
+                LOG_INFO("[transfer] f%llu: %u tiles (%u-%u) from tile %u pitch %u %ux format %u%s to tile %u pitch %u %ux format %u%s, for %u,%u-%u,%u%s",
+                    (unsigned long long)frameNumber, count, first, last, source->base, source->pitch, source->samples, source->format, source->depth ? " depth" : "", target.base,
+                    target.pitch, target.samples, target.format, target.depth ? " depth" : "", left, top, right, bottom,
+                    mode == TransferMode::kNone ? " (not copied)" : mode == TransferMode::kRaw ? " (as words)" : "");
+            }
+            if (std::find(m_reportedTransfers.begin(), m_reportedTransfers.end(), pair) == m_reportedTransfers.end())
+            {
+                m_reportedTransfers.push_back(pair);
+                LOG_INFO("GPU: EDRAM at tile %u, pitch %u, %ux MSAA, format %u%s goes to pitch %u, %ux MSAA, format %u%s%s", source->base, source->pitch,
+                    source->samples, source->format, source->depth ? " (depth)" : "", target.pitch, target.samples, target.format,
+                    target.depth ? " (depth)" : "",
+                    mode == TransferMode::kNone ? " (not copied)" : mode == TransferMode::kRaw ? " (as EDRAM words)" : "");
+            }
+            if (mode != TransferMode::kNone)
+                Transfer(list, upload, *source, target, mask);
+        }
+        if (changed)
+            m_ownerEpoch++;
+        target.checkedEpoch = m_ownerEpoch;
+        target.checked[0] = c0;
+        target.checked[1] = c1;
+        target.checked[2] = r0;
+        target.checked[3] = r1;
+    }
+
+    // stencilBit 0-7: the pass setting that bit of a depth destination's stencil (see m_stencilTransfer).
+    ID3D12PipelineState* RenderTargetCache::TransferPipeline(const Target& dest, bool sourceMultisampled, int stencilBit)
+    {
+        const bool bitPass = dest.depth && stencilBit >= 0;
+        const bool stencil = dest.depth && m_stencilTransfer == StencilTransfer::kShader && !bitPass;
+        const uint64_t key = uint64_t(dest.viewFormat) | (uint64_t(dest.hostSamples) << 16) | (uint64_t(dest.depth) << 24) | (uint64_t(sourceMultisampled) << 25) |
+                             (uint64_t(bitPass ? stencilBit + 1 : 0) << 26);
+        ComPtr<ID3D12PipelineState>& pipeline = m_transferPipelines[key];
+        if (pipeline)
+            return pipeline.Get();
+        const uint32_t variant = (sourceMultisampled ? 1 : 0) | (dest.depth ? 2 : 0) | (stencil ? 4 : 0) | (bitPass ? 8 : 0);
+        ComPtr<ID3DBlob>& shader = m_transferPixelShaders[variant];
+        if (!shader)
+        {
+            const std::string source = std::string(sourceMultisampled ? "#define XE_SOURCE_MSAA 1\n" : "") + (dest.depth ? "#define XE_DEPTH 1\n" : "") +
+                                       (stencil ? "#define XE_STENCIL 1\n" : "") + (bitPass ? "#define XE_STENCIL_BIT 1\n" : "") + kTransferPixelShader;
+            shader = CompileShader(source.c_str(), "main", "ps_5_1", "EDRAM transfer");
+            if (!shader)
+                return nullptr;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+        description.pRootSignature = m_transferRootSignature.Get();
+        description.VS = { m_transferVertexShader->GetBufferPointer(), m_transferVertexShader->GetBufferSize() };
+        description.PS = { shader->GetBufferPointer(), shader->GetBufferSize() };
+        description.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        description.SampleMask = UINT_MAX;
+        description.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        description.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        description.RasterizerState.DepthClipEnable = TRUE;
+        if (dest.depth)
+        {
+            // The stencil is replaced: by the shader's (SV_StencilRef), or by the reference (0, then 0xFF for each bit pass).
+            description.DepthStencilState.DepthEnable = !bitPass;
+            description.DepthStencilState.DepthWriteMask = bitPass ? D3D12_DEPTH_WRITE_MASK_ZERO : D3D12_DEPTH_WRITE_MASK_ALL;
+            description.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+            description.DepthStencilState.StencilEnable = bitPass || m_stencilTransfer != StencilTransfer::kNone;
+            description.DepthStencilState.StencilReadMask = 0xFF;
+            description.DepthStencilState.StencilWriteMask = bitPass ? uint8_t(1u << stencilBit) : 0xFF;
+            const D3D12_DEPTH_STENCILOP_DESC replace{ D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_KEEP, D3D12_STENCIL_OP_REPLACE, D3D12_COMPARISON_FUNC_ALWAYS };
+            description.DepthStencilState.FrontFace = description.DepthStencilState.BackFace = replace;
+            description.DSVFormat = dest.viewFormat;
+        }
+        else
+        {
+            description.NumRenderTargets = 1;
+            description.RTVFormats[0] = dest.viewFormat;
+        }
+        description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        description.SampleDesc.Count = dest.hostSamples;
+        if (FAILED(m_device->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(&pipeline))))
+        {
+            LOG_ERROR("D3D12: can't create an EDRAM transfer pipeline (format %u, %u samples)", uint32_t(dest.viewFormat), dest.hostSamples);
+            return nullptr;
+        }
+        return pipeline.Get();
+    }
+
+    void RenderTargetCache::Transfer(ID3D12GraphicsCommandList* list, UploadAllocator& upload, Target& source, Target& dest,
+        const std::array<uint32_t, 64>& mask)
+    {
+        ID3D12PipelineState* pipeline = TransferPipeline(dest, source.hostSamples > 1);
+        if (!pipeline)
+            return;
+        EndPass(list);
+        transfers++;
+
+        // The tiles' bounding box in the destination (host pixels).
+        const TileLayout layout = LayoutOf(dest), sourceLayout = LayoutOf(source);
+        uint32_t minColumn = UINT32_MAX, maxColumn = 0, minRow = UINT32_MAX, maxRow = 0;
+        for (uint32_t tile = dest.base; tile < kEdramTiles; tile++)
+        {
+            if (!(mask[tile >> 5] & (1u << (tile & 31))))
+                continue;
+            const uint32_t row = (tile - dest.base) / layout.pitchTiles, column = (tile - dest.base) % layout.pitchTiles;
+            minColumn = std::min(minColumn, column);
+            maxColumn = std::max(maxColumn, column);
+            minRow = std::min(minRow, row);
+            maxRow = std::max(maxRow, row);
+        }
+        if (minRow == UINT32_MAX)
+            return;
+        const D3D12_RECT scissor{ LONG(minColumn * layout.width * scale), LONG(minRow * layout.height * scale),
+            LONG(std::min((maxColumn + 1) * layout.width, dest.width) * scale), LONG(std::min((maxRow + 1) * layout.height, dest.height) * scale) };
+        if (scissor.right <= scissor.left || scissor.bottom <= scissor.top)
+            return;
+
+        Transition(list, source, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        D3D12_RENDER_PASS_RENDER_TARGET_DESC color{};
+        D3D12_RENDER_PASS_DEPTH_STENCIL_DESC depth{};
+        if (dest.depth)
+        {
+            Transition(list, dest, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+            depth.cpuDescriptor = dest.view;
+            depth.DepthBeginningAccess.Type = depth.StencilBeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+            depth.DepthEndingAccess.Type = depth.StencilEndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+            m_passList4->BeginRenderPass(0, nullptr, &depth, D3D12_RENDER_PASS_FLAG_NONE);
+        }
+        else
+        {
+            Transition(list, dest, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            color.cpuDescriptor = dest.view;
+            color.BeginningAccess.Type = D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE;
+            color.EndingAccess.Type = D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE;
+            m_passList4->BeginRenderPass(1, &color, nullptr, D3D12_RENDER_PASS_FLAG_NONE);
+        }
+
+        TransferConstants constants{};
+        constants.destBase = dest.base;
+        constants.destPitchTiles = layout.pitchTiles;
+        constants.destLog2Samples = uint32_t(std::countr_zero(dest.samples));
+        constants.destSampleRatio = std::max(dest.hostSamples / dest.samples, 1u);
+        constants.sourceBase = source.base;
+        constants.sourcePitchTiles = sourceLayout.pitchTiles;
+        constants.sourceLog2Samples = uint32_t(std::countr_zero(source.samples));
+        constants.sourceSampleRatio = std::max(source.hostSamples / source.samples, 1u);
+        constants.tileSamplesX = !dest.depth && xenos::Is64bpp(xenos::ColorFormat(dest.format)) ? 40 : 80;
+        constants.scale = scale;
+        constants.mode = ModeOf(source, dest) == TransferMode::kRaw ? 1 : 0;
+        constants.sourceFormat = RawFormat(source);
+        constants.destFormat = RawFormat(dest);
+        const UploadAllocator::Allocation maskData = upload.Allocate(sizeof(mask), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+        memcpy(maskData.cpu, mask.data(), sizeof(mask));
+        list->SetGraphicsRootSignature(m_transferRootSignature.Get());
+        list->SetPipelineState(pipeline);
+        list->SetGraphicsRoot32BitConstants(0, sizeof(constants) / 4, &constants, 0);
+        list->SetGraphicsRootConstantBufferView(1, maskData.gpu);
+        list->SetGraphicsRootDescriptorTable(2, m_views->Gpu(source.srv));
+        list->SetGraphicsRootDescriptorTable(3, m_views->Gpu(source.depth ? source.stencilSrv : source.srv));
+        const D3D12_VIEWPORT viewport{ 0.0f, 0.0f, float(dest.width * scale), float(dest.height * scale), 0.0f, 1.0f };
+        list->RSSetViewports(1, &viewport);
+        list->RSSetScissorRects(1, &scissor);
+        list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        if (dest.depth)
+            list->OMSetStencilRef(0);
+        list->DrawInstanced(3, 1, 0, 0);
+        // Without SV_StencilRef, the stencil the pass above zeroed gets the source's a bit at a time. (DOAX2's D3D clears
+        // depth and stencil as a surface of half the pitch with 4x MSAA, so its stencil effects depend on this. The Marine
+        // Race counts the sea's faces in the stencil and blends a teal color where the count is above the cleared value:
+        // without the clear, counts piled up from frame to frame, and a teal wedge covered the race.)
+        if (dest.depth && m_stencilTransfer == StencilTransfer::kBits)
+        {
+            list->OMSetStencilRef(0xFF);
+            for (int bit = 0; bit < 8; bit++)
+            {
+                ID3D12PipelineState* bitPipeline = TransferPipeline(dest, source.hostSamples > 1, bit);
+                if (!bitPipeline)
+                    break;
+                list->SetPipelineState(bitPipeline);
+                list->SetGraphicsRoot32BitConstant(0, uint32_t(bit), offsetof(TransferConstants, stencilBit) / 4);
+                list->DrawInstanced(3, 1, 0, 0);
+            }
+        }
+        m_passList4->EndRenderPass();
+    }
+
+    void RenderTargetCache::UseList(ID3D12GraphicsCommandList* list)
+    {
+        if (m_passList == list)
+            return;
+        EndPass(list); // (a pass on the list before ended with it)
+        m_passList = list;
+        m_passList4.Reset();
+        list->QueryInterface(IID_PPV_ARGS(&m_passList4));
     }
 
     void RenderTargetCache::EndPass(ID3D12GraphicsCommandList* list)
@@ -655,6 +1254,7 @@ void main(uint3 id : SV_DispatchThreadID)
 
     void RenderTargetCache::Resolve(ID3D12GraphicsCommandList* list, UploadAllocator& upload)
     {
+        UseList(list);
         EndPass(list);
         const uint32_t copyControl = Register(reg::RB_COPY_CONTROL);
         const uint32_t sourceSelect = copyControl & 7;
@@ -710,19 +1310,19 @@ void main(uint3 id : SV_DispatchThreadID)
             return;
         resolves++;
         profile::Count(profile::Counter::kResolves);
+        Acquire(list, upload, *source, uint32_t(x0), uint32_t(y0), uint32_t(x1), uint32_t(y1));
 
         // Copy.
         const uint32_t destBase = Register(reg::RB_COPY_DEST_BASE);
         const uint32_t destPitchInfo = Register(reg::RB_COPY_DEST_PITCH);
         const uint32_t destInfo = Register(reg::RB_COPY_DEST_INFO);
         const uint32_t destFormat = (destInfo >> 7) & 0x3F;
-        // Depth goes to any 32-bit format (raw EDRAM words, sampled as k_24_8 / k_24_8_FLOAT or k_8_8_8_8). Of the 16-bit
-        // formats, k_5_6_5 (DOA4's attract cinematic builds a glow in it).
+        // Depth goes to any 32-bit format (raw EDRAM words, sampled as k_24_8 / k_24_8_FLOAT or k_8_8_8_8).
         const bool depthSource = sourceSelect >= 4;
         const bool wideDest = destFormat == 26 || destFormat == 32 || destFormat == 37;
-        const bool narrowDest = destFormat == 4;
-        const bool supported = depthSource ? !wideDest && !narrowDest
-                                           : (destFormat == 4 || destFormat == 6 || destFormat == 7 || destFormat == 25 || destFormat == 26 ||
+        const uint32_t smallBytes = destFormat == 2 ? 1 : destFormat == 4 ? 2 : 0; // k_8, k_5_6_5 (DOAX2)
+        const bool supported = depthSource ? !wideDest && !smallBytes
+                                           : (smallBytes || destFormat == 6 || destFormat == 7 || destFormat == 25 || destFormat == 26 ||
                                                  destFormat == 31 || destFormat == 32 || destFormat == 36 || destFormat == 37 || destFormat == 62);
         if (command != 3 && destBase && supported)
         {
@@ -730,9 +1330,22 @@ void main(uint3 id : SV_DispatchThreadID)
             const uint32_t alignedPitch = (destPitch + 31) & ~31u;
             const uint32_t originX = uint32_t(x0) & 31, originY = uint32_t(y0) & 31;
             const uint32_t width = uint32_t(x1 - x0), height = uint32_t(y1 - y0);
-            const uint32_t bytesPerPixel = wideDest ? 8 : narrowDest ? 2 : 4;
+            const uint32_t bytesPerPixel = wideDest ? 8 : smallBytes ? smallBytes : 4;
             const uint32_t rows = (originY + height + 31) & ~31u;
             const uint32_t destSize = alignedPitch * rows * bytesPerPixel;
+            // LOG_RESOLVES=<hex physical address> (diagnostics): logs the resolves whose destination covers it; =1, the
+            // first 2000 resolves.
+            static const uint32_t logAddress = [] {
+                const char* setting = std::getenv(GAME_PREFIX "_LOG_RESOLVES");
+                return setting ? uint32_t(strtoul(setting, nullptr, 16)) : 0u;
+            }();
+            static uint32_t logged = 0;
+            if (logAddress == 1 ? logged < 2000 : logAddress - destBase < destSize)
+            {
+                logged++;
+                LOG_INFO("GPU: resolve %ux%u at %d,%d of tile %u (pitch %u, %ux, format %u%s) to %08X (pitch %u, format %u)", width, height, x0, y0,
+                    source->base, pitch, samples, source->format, depthSource ? ", depth" : "", destBase, destPitch, destFormat);
+            }
 
             // Pages partly covered must hold current data before the GPU overwrites the rest.
             m_sharedMemory->RequestRange(upload, destBase, destSize);
@@ -768,7 +1381,7 @@ void main(uint3 id : SV_DispatchThreadID)
             constants.resolutionScale = scale;
 
             // The 32x32 macro tiles the resolve writes, as one byte range per row of them.
-            const uint32_t log2Bpp = wideDest ? 3 : narrowDest ? 1 : 2;
+            const uint32_t log2Bpp = wideDest ? 3 : smallBytes == 1 ? 0 : smallBytes == 2 ? 1 : 2;
             const uint32_t tileBytes = 1u << (log2Bpp + 10);
             const uint32_t firstColumn = originX >> 5, columns = ((originX + width - 1) >> 5) - firstColumn + 1;
             std::vector<std::pair<uint32_t, uint32_t>> written;
@@ -783,16 +1396,13 @@ void main(uint3 id : SV_DispatchThreadID)
             // (Unused without the scaled pass; root descriptors just need an address.)
             list->SetComputeRootShaderResourceView(3, m_sharedMemory->GpuAddress());
             list->SetComputeRootUnorderedAccessView(4, m_sharedMemory->GpuAddress());
-            // (16-bit formats: a thread per pair of pixels.)
-            const uint32_t threadsX = narrowDest ? ((originX + width + 1) >> 1) - (originX >> 1) : width;
-            list->Dispatch((threadsX + 7) / 8, (height + 7) / 8, 1);
+            list->Dispatch((width + 7) / 8, (height + 7) / 8, 1);
             m_sharedMemory->UavBarrier(list);
             for (const auto& [start, length] : written)
                 watch::NoteGpuWrite(start, length);
 
-            // Resolution scaling: the scaled copy, a thread per host pixel (see ScaledResolves). Textures load from them
-            // only with 4 or 8 bytes per texel.
-            bool scaledStorage = scale > 1 && !narrowDest;
+            // Resolution scaling: the scaled copy, a thread per host pixel (see ScaledResolves), of 4- and 8-byte texels.
+            bool scaledStorage = scale > 1 && !smallBytes;
             for (const auto& [start, length] : written)
                 scaledStorage = scaledStorage && m_scaledResolves->Allocate(list, upload, start, length);
             if (scaledStorage)
@@ -847,6 +1457,7 @@ void main(uint3 id : SV_DispatchThreadID)
                         rgba[i] = float(((i < 2 ? low : value) >> (16 * (i & 1))) & 0xFFFF) / 65535.0f;
                     break;
                 }
+                Acquire(list, upload, *color, uint32_t(x0), uint32_t(y0), uint32_t(x1), uint32_t(y1));
                 Transition(list, *color, D3D12_RESOURCE_STATE_RENDER_TARGET);
                 list->ClearRenderTargetView(color->view, rgba, 1, &rect);
             }
@@ -859,6 +1470,7 @@ void main(uint3 id : SV_DispatchThreadID)
                 const uint32_t value = Register(reg::RB_DEPTH_CLEAR);
                 const float depthValue = xenos::DepthFormat(depth->format) == xenos::DepthFormat::kD24FS8 ? Float20e4ToFloat(value >> 8)
                                                                                                         : float(value >> 8) / float(0xFFFFFF);
+                Acquire(list, upload, *depth, uint32_t(x0), uint32_t(y0), uint32_t(x1), uint32_t(y1));
                 Transition(list, *depth, D3D12_RESOURCE_STATE_DEPTH_WRITE);
                 list->ClearDepthStencilView(depth->view, D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, depthValue, uint8_t(value & 0xFF), 1, &rect);
             }

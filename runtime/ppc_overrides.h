@@ -74,6 +74,19 @@ static inline __attribute__((always_inline)) void PPCStoreCheckAligned(const uin
         PPCStoreCheck(base, ppcStoreAddress, 8);                                                                               \
         *(volatile uint64_t*)(base + ppcStoreAddress) = __builtin_bswap64(y);                                                  \
     } while (0)
+// Stores XenonRecomp takes for MMIO (followed by eieio) are plain stores, and those into the XMA decoder's register page
+// (0x7FEA0000-0x7FEAFFFF) also go to the decoder (audio/xma.cpp) with the register's value: the registers are little
+// endian, so it's the stored word byte-swapped, whether stw stored it or stwbrx. (DOAX2's XAudio drives the decoder
+// through them; DOA4's MMIO stores are D3D's, to the GPU's registers, which the command processor reads.)
+void XmaRegisterWrite(uint32_t address, uint32_t value);
+#define PPC_MM_STORE_U32(x, y)                                                                                                 \
+    do                                                                                                                         \
+    {                                                                                                                          \
+        const uint32_t ppcMmioAddress = uint32_t(x), ppcMmioValue = uint32_t(y);                                               \
+        PPC_STORE_U32(ppcMmioAddress, ppcMmioValue);                                                                           \
+        if ((ppcMmioAddress & 0xFFFF0000) == 0x7FEA0000)                                                                       \
+            XmaRegisterWrite(ppcMmioAddress, __builtin_bswap32(ppcMmioValue));                                                 \
+    } while (0)
 // Runs of stores off one base register in straight-line code have one check of the bytes they write before the first
 // (XenonRecomp's group_stores, config/DOA4.toml): theirs are stores without one. Nothing between the check and the stores
 // can arm a page again (a frame boundary comes only through a call).

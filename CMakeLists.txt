@@ -4,17 +4,39 @@ cmake_minimum_required(VERSION 3.25)
 cmake_policy(SET CMP0141 NEW)
 
 # The game. GAME_PREFIX names the targets and, in lower case, the executable (doa4.exe) and its log; the runtime
-# reads its environment variables with it (DOA4_TRACE, ...) and gets GAME_TITLE for its window and messages, and
-# GAME_VERSION, the version of the game it supports, for the messages about its disc image. The runtime's sources only
-# use these macros, so they can stay the same as doax2-recomp's. GAME_LAUNCHER names the launcher, what a player starts
-# in a release ("DOA4 Launcher.exe", runtime/launcher/), and GAME_REGION the regions of the disc it supports, which
-# the launcher names with the version.
+# reads its environment variables with it (DOA4_TRACE, ...) and gets GAME_TITLE for its window and messages. The
+# runtime's sources only use these macros, so they can stay the same as doax2-recomp's. GAME_VERSION is the version of
+# the game it supports, when the game had more than one (DOAX2 had one: none), and GAME_REGION the regions of the disc;
+# with the title they make GAME_DISC, the disc image players need as the launcher and the messages name it ("Dead or
+# Alive 4 (Rev 1) (USA, Europe)"). GAME_LAUNCHER names the launcher, what a player starts in a release ("DOA4
+# Launcher.exe", runtime/launcher/).
 set(GAME_PREFIX DOA4)
 set(GAME_TITLE "Dead or Alive 4")
 set(GAME_VERSION "Rev 1")
 set(GAME_REGION "USA, Europe")
+if (GAME_VERSION)
+    set(GAME_DISC "${GAME_TITLE} (${GAME_VERSION}) (${GAME_REGION})")
+else()
+    set(GAME_DISC "${GAME_TITLE} (${GAME_REGION})")
+endif()
 string(TOLOWER "${GAME_PREFIX}" GAME_EXECUTABLE)
 set(GAME_LAUNCHER "${GAME_PREFIX} Launcher")
+# GAME_UTILITY_DRIVE: whether the hard disk has its raw Partition0, where XAPI keeps the header of the cache partition a
+# title mounts as cache: (its secure utility drive), formatting a cache partition for it on first use. DOAX2 copies its
+# archives there, as on a console. DOA4 would copy seven (chrone, chrtwo, chrthree, spr, snd, mot and cmn.afs: 2.07 GB)
+# in the background as it plays, which a PC's disc image doesn't need, and which a netplay session's rollbacks would
+# meet half done; without Partition0 its cache doesn't mount and it reads them from the disc (runtime/main.cpp).
+set(GAME_UTILITY_DRIVE 0)
+# GAME_SYSTEM_UI_NOTIFICATIONS: whether system UIs (answered at once, runtime/xam/ui.cpp) tell the game's listeners they
+# opened and closed (XN_SYS_UI). DOAX2's XBOX LIVE menu waits for them. DOA4 doesn't, and a listener of XAPI's that it
+# stops polling as Versus's first screen shows its message boxes, and polls again at the fight's start, would hear of
+# them there and run the fight's intro 3 frames late, which a savestate taken there doesn't hold (the listeners' queues
+# are the host's): its sync test failed.
+set(GAME_SYSTEM_UI_NOTIFICATIONS 0)
+# GAME_NETPLAY: whether the launcher offers netplay, which needs a game layer for it (one that registers
+# netplay::GameState, runtime/netplay/game_state.h): DOA4 has one; DOAX2 doesn't (its online play would be an emulated
+# Xbox Live: ANALYSIS.md, Phase 8), so its launcher just plays.
+set(GAME_NETPLAY 1)
 
 project(${GAME_PREFIX}Recomp CXX)
 
@@ -59,8 +81,10 @@ add_library(${GAME_PREFIX}Runtime OBJECT
     runtime/guest_setjmp.cpp
     runtime/guest_traps.cpp
     runtime/imports.cpp
+    runtime/module/crt_exports.cpp
     runtime/page_heap.cpp
     runtime/store_miss.cpp
+    runtime/kernel/crypt.cpp
     runtime/kernel/file_exports.cpp
     runtime/kernel/memory.cpp
     runtime/kernel/misc.cpp
@@ -124,7 +148,9 @@ add_library(${GAME_PREFIX}Runtime OBJECT
     runtime/xam/misc.cpp
     runtime/xam/net.cpp
     runtime/xam/spa.cpp
+    runtime/xam/ui.cpp
     runtime/xam/user.cpp
+    runtime/xam/xmp.cpp
     runtime/vfs/host_device.cpp
     runtime/vfs/iso_device.cpp
     runtime/vfs/vfs.cpp)
@@ -136,18 +162,21 @@ target_compile_options(${GAME_PREFIX}Runtime PUBLIC /arch:AVX "/FI${CMAKE_SOURCE
 # return (runtime/store_miss.cpp).
 set_source_files_properties(runtime/store_miss.cpp PROPERTIES COMPILE_OPTIONS "/clang:-mno-vzeroupper")
 target_compile_definitions(${GAME_PREFIX}Runtime PUBLIC NOMINMAX WIN32_LEAN_AND_MEAN _CRT_SECURE_NO_WARNINGS
-    "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_VERSION=\"${GAME_VERSION}\""
-    "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" "GAME_LAUNCHER=\"${GAME_LAUNCHER}.exe\"")
+    "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_DISC=\"${GAME_DISC}\""
+    "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" "GAME_LAUNCHER=\"${GAME_LAUNCHER}.exe\""
+    "GAME_SYSTEM_UI_NOTIFICATIONS=${GAME_SYSTEM_UI_NOTIFICATIONS}")
 # The build's configuration, which netplay's handshake reports with the build (runtime/netplay/identity.h).
 target_compile_definitions(${GAME_PREFIX}Runtime PRIVATE "GAME_BUILD_CONFIG=\"$<CONFIG>\"")
 
-# FFmpeg's libavcodec decodes XMA audio: a shared LGPL build in third_party/ffmpeg (tools\getffmpeg.ps1
-# fetches it). Without it everything builds and runs, but XMA audio is silent.
+# FFmpeg's libavcodec decodes XMA audio and the music player's MP3s (libswresample converts those): a shared LGPL
+# build in third_party/ffmpeg (tools\getffmpeg.ps1 fetches it). Without it everything builds and runs, but XMA audio
+# and the music player are silent.
 set(FFMPEG_ROOT "${CMAKE_SOURCE_DIR}/third_party/ffmpeg" CACHE PATH "FFmpeg shared build (include, lib, bin)")
 file(GLOB FFMPEG_DLLS "${FFMPEG_ROOT}/bin/avcodec-*.dll" "${FFMPEG_ROOT}/bin/avutil-*.dll" "${FFMPEG_ROOT}/bin/swresample-*.dll")
 if (EXISTS "${FFMPEG_ROOT}/include/libavcodec/avcodec.h" AND EXISTS "${FFMPEG_ROOT}/lib/avcodec.lib" AND FFMPEG_DLLS)
     target_include_directories(${GAME_PREFIX}Runtime PUBLIC "${FFMPEG_ROOT}/include")
-    target_link_libraries(${GAME_PREFIX}Runtime PUBLIC "${FFMPEG_ROOT}/lib/avcodec.lib" "${FFMPEG_ROOT}/lib/avutil.lib")
+    target_link_libraries(${GAME_PREFIX}Runtime PUBLIC "${FFMPEG_ROOT}/lib/avcodec.lib" "${FFMPEG_ROOT}/lib/avutil.lib"
+        "${FFMPEG_ROOT}/lib/swresample.lib")
     target_compile_definitions(${GAME_PREFIX}Runtime PUBLIC HAVE_FFMPEG=1)
 else()
     set(FFMPEG_DLLS "")
@@ -155,8 +184,9 @@ else()
 endif()
 
 # The executable's own code: main(), the module's loader, and runtime/game/, which holds replacements for specific
-# recompiled game functions (PPC_FUNC(sub_*) definitions, which the generated code's calls reach instead of its own),
-# keyed by DOA4's addresses. An OBJECT library, so tools/moduledefs.py can read its objects before the executable links.
+# recompiled game functions (PPC_FUNC(sub_*) definitions, which the generated code's calls reach instead of its own)
+# and the mid-asm hooks config/DOA4.toml places inside them, keyed by DOA4's addresses. An OBJECT library, so
+# tools/moduledefs.py can read its objects before the executable links.
 add_library(${GAME_PREFIX}Game OBJECT
     runtime/main.cpp
     runtime/module/loader.cpp
@@ -175,20 +205,21 @@ add_library(${GAME_PREFIX}Game OBJECT
     runtime/game/video_menu.cpp
     runtime/game/waits.cpp)
 target_link_libraries(${GAME_PREFIX}Game PUBLIC ${GAME_PREFIX}Runtime)
+# (main.cpp mounts the hard disk.)
+target_compile_definitions(${GAME_PREFIX}Game PRIVATE "GAME_UTILITY_DRIVE=${GAME_UTILITY_DRIVE}")
 
 # --- The game's code module: <executable>_ppc.dll ---
-# The recompiled code isn't in the executable: a player's PC builds it from their own game, with clang and lld alone
-# (no Visual Studio or Windows SDK headers or libraries), into a module the executable loads (ANALYSIS.md, Phase 5,
-# The game's code module). This builds it the same way, with the commands of tools\buildmodule.ps1, the player's
-# build, rather than CMake's compile rules, which would add the configuration's flags: the flags are
-# runtime/module/compile.rsp and link.rsp, and the objects link in name order. The executable and the module import
-# from each other through two .def files, which tools/moduledefs.py writes from the executable's objects:
-# <executable>.def (what the executable exports: the runtime's functions the generated code calls, the imports'
-# implementations and the replacements of game functions) and <module>.def (the generated functions the runtime calls).
-# Release builds it without debug info, byte for byte the player's module; the other configurations add a PDB (public
-# symbols: the generated code has no debug info).
-# The module's clang and lld-link are LLVM's own build, which a release ships for players to build it with
-# (tools\getllvm.ps1 puts it in third_party\llvm), so the module tested is the module players build; without it,
+# The recompiled code isn't in the executable but in a module the executable loads (ANALYSIS.md, Phase 5, The game's
+# code module), which a release ships beside it. It's built with clang and lld alone (no Visual Studio or Windows SDK
+# headers or libraries: runtime/module/include's shims), with the commands of runtime/module/compile.rsp and link.rsp
+# rather than CMake's compile rules, which would add the configuration's flags, and its objects link in name order, so
+# the same inputs give the same file. The executable and the module import from each other through two .def files,
+# which tools/moduledefs.py writes from the executable's objects: <executable>.def (what the executable exports: the
+# runtime's functions the generated code calls, the imports' implementations, the replacements of game functions and
+# the config's mid-asm hooks) and <module>.def (the generated functions the runtime calls).
+# Release builds it without debug info, as a release ships it; the other configurations add a PDB (public symbols: the
+# generated code has no debug info).
+# The module's clang and lld-link are LLVM's own build when tools\getllvm.ps1 has put one in third_party\llvm, else
 # Visual Studio's, the same version today, which builds the same module. llvm-nm, which only reads the executable's
 # objects, is the compiler's.
 get_filename_component(LLVM_BIN "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -196,7 +227,7 @@ set(LLVM_ROOT "${CMAKE_SOURCE_DIR}/third_party/llvm" CACHE PATH "LLVM that build
 if (EXISTS "${LLVM_ROOT}/bin/clang.exe" AND EXISTS "${LLVM_ROOT}/bin/lld-link.exe")
     set(MODULE_LLVM_BIN "${LLVM_ROOT}/bin")
 else()
-    message(WARNING "LLVM not found in ${LLVM_ROOT}: the game's code module is built with Visual Studio's clang and lld-link instead of the LLVM a release ships (run tools\\getllvm.ps1)")
+    message(STATUS "LLVM not found in ${LLVM_ROOT}: the game's code module is built with Visual Studio's clang and lld-link (tools\\getllvm.ps1 gets LLVM's own build)")
     set(MODULE_LLVM_BIN "${LLVM_BIN}")
 endif()
 set(MODULE_CLANG "${MODULE_LLVM_BIN}/clang.exe")
@@ -225,8 +256,9 @@ add_custom_command(OUTPUT "${EXECUTABLE_DEF}" "${MODULE_DEF}"
         --objects "${MODULE_DIR}/executable_objects.txt" --imports "${CMAKE_SOURCE_DIR}/runtime/imports.inc"
         --base "${CMAKE_SOURCE_DIR}/runtime/module/runtime_exports.def" --executable "${GAME_EXECUTABLE}.exe"
         --module "${MODULE_NAME}.dll" --out-executable "${EXECUTABLE_DEF}" --out-module "${MODULE_DEF}"
+        --config "${CMAKE_SOURCE_DIR}/config/${GAME_PREFIX}.toml"
     DEPENDS $<TARGET_OBJECTS:${GAME_PREFIX}Runtime> $<TARGET_OBJECTS:${GAME_PREFIX}Game> "${MODULE_DIR}/executable_objects.txt"
-        tools/moduledefs.py runtime/imports.inc runtime/module/runtime_exports.def
+        tools/moduledefs.py runtime/imports.inc runtime/module/runtime_exports.def "config/${GAME_PREFIX}.toml"
     COMMENT "Listing what the executable and the game's code module import from each other" VERBATIM)
 add_custom_command(OUTPUT "${EXECUTABLE_IMPORTS}"
     COMMAND "${MODULE_LLD}" /lib /nologo "/def:${EXECUTABLE_DEF}" /machine:x64 "/out:${EXECUTABLE_IMPORTS}"
@@ -236,7 +268,7 @@ add_custom_command(OUTPUT "${MODULE_IMPORTS}"
     DEPENDS "${MODULE_DEF}" VERBATIM)
 add_custom_target(${GAME_PREFIX}ModuleImports DEPENDS "${EXECUTABLE_IMPORTS}" "${MODULE_IMPORTS}")
 
-# The module's objects: the generated code and runtime/module/module.cpp, each compiled as the player's build does.
+# The module's objects: the generated code and runtime/module/module.cpp, each compiled with the module's flags.
 file(GLOB MODULE_SHIMS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/runtime/module/include/*")
 file(GLOB PPC_HEADERS CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/ppc/*.h")
 file(GLOB SIMDE_HEADERS CONFIGURE_DEPENDS "${SIMDE_INCLUDE_DIR}/*.h" "${SIMDE_INCLUDE_DIR}/x86/*.h")
@@ -255,7 +287,7 @@ foreach (source ${MODULE_SOURCES})
         COMMENT "Compiling the game's code: ${name}" VERBATIM)
     list(APPEND MODULE_OBJECTS "${object}")
 endforeach()
-# The objects in name order (ordinal), as the player's build lists them, so both link the same file.
+# The objects in name order (ordinal), so every build links them the same way.
 list(SORT MODULE_OBJECTS)
 list(JOIN MODULE_OBJECTS "\n" MODULE_OBJECT_LINES)
 file(WRITE "${MODULE_DIR}/objects.rsp.new" "${MODULE_OBJECT_LINES}\n")
@@ -288,17 +320,14 @@ target_link_options(${GAME_EXECUTABLE} PRIVATE /STACK:0x1000000)
 
 # --- The launcher: "<GAME_LAUNCHER>.exe" ---
 # What a player starts in a release (runtime/launcher/launcher.h; ANALYSIS.md, Phase 5, Packaging, The launcher): it
-# checks the player's disc image, builds the game's code module from it with the release's toolchain when the module is
-# missing or isn't the release's, and starts the game, on this PC or in a netplay session. A program of its own (the
-# executable keeps its name, which the module imports from): the runtime's disc reader and nothing else of the runtime,
-# the C runtime linked in, only Windows' own DLLs imported, and a manifest for the common controls' visual styles and
-# per-monitor DPI awareness. GAME_GENERATED_SOURCES, the .cpp files XenonRecomp generates, measures its progress.
+# checks the release's files and the player's disc image, remembers the disc image, and starts the game, on this PC or
+# in a netplay session. A program of its own (the executable keeps its name, which the module imports from): the
+# runtime's disc reader and nothing else of the runtime, the C runtime linked in, only Windows' own DLLs imported, and a
+# manifest for the common controls' visual styles and per-monitor DPI awareness.
 enable_language(RC)
 set(LAUNCHER_MANIFEST "${CMAKE_SOURCE_DIR}/runtime/launcher/launcher.manifest")
 configure_file(runtime/launcher/launcher.rc.in "${CMAKE_CURRENT_BINARY_DIR}/launcher/launcher.rc" @ONLY)
-list(LENGTH PPC_SOURCES GAME_GENERATED_SOURCES)
 add_executable(${GAME_PREFIX}Launcher WIN32
-    runtime/launcher/build.cpp
     runtime/launcher/files.cpp
     runtime/launcher/main.cpp
     runtime/launcher/play.cpp
@@ -310,8 +339,8 @@ set_target_properties(${GAME_PREFIX}Launcher PROPERTIES OUTPUT_NAME "${GAME_LAUN
 set_property(SOURCE "${CMAKE_CURRENT_BINARY_DIR}/launcher/launcher.rc" APPEND PROPERTY OBJECT_DEPENDS "${LAUNCHER_MANIFEST}")
 target_include_directories(${GAME_PREFIX}Launcher PRIVATE runtime)
 target_compile_definitions(${GAME_PREFIX}Launcher PRIVATE $<$<COMPILE_LANGUAGE:CXX>:NOMINMAX WIN32_LEAN_AND_MEAN UNICODE _UNICODE
-    _CRT_SECURE_NO_WARNINGS "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_VERSION=\"${GAME_VERSION}\""
-    "GAME_REGION=\"${GAME_REGION}\"" "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" GAME_GENERATED_SOURCES=${GAME_GENERATED_SOURCES}>)
+    _CRT_SECURE_NO_WARNINGS "GAME_PREFIX=\"${GAME_PREFIX}\"" "GAME_TITLE=\"${GAME_TITLE}\"" "GAME_DISC=\"${GAME_DISC}\""
+    "GAME_EXECUTABLE=\"${GAME_EXECUTABLE}\"" GAME_NETPLAY=${GAME_NETPLAY}>)
 target_link_libraries(${GAME_PREFIX}Launcher PRIVATE comctl32 ole32 shell32 shlwapi uuid bcrypt ws2_32)
 # The manifest is the resource's (launcher.rc.in), not one the linker makes.
 target_link_options(${GAME_PREFIX}Launcher PRIVATE /MANIFEST:NO)

@@ -59,6 +59,9 @@ namespace gpu::shader
 
         // Analysis.
         bool structuredControlFlow = true; // no loops, calls or jumps
+        bool forwardControlFlow = true;    // no loops or calls, and jumps that never close a cycle
+        std::vector<uint32_t> forwardOrder; // with forwardControlFlow (and jumps): the CF instructions in an order where each
+                                            // follows all that can lead to it
         uint32_t tempCount = 0;            // highest temp register used + 1
         bool relativeTemps = false;
         bool relativeConstants = false;
@@ -72,6 +75,10 @@ namespace gpu::shader
         uint32_t colorTargetsWritten = 0; // pixel shader oC0-oC3 (bitmask)
         bool writesDepth = false;
         std::vector<uint32_t> vertexFetchConstants; // vertex fetch constant indices used (2-dword slots)
+        // The first full vertex fetch, where D3D's clears and blits read their screen-space position: its fetch constant
+        // (UINT32_MAX if none), stride and offset in dwords, and format.
+        uint32_t firstVertexConstant = UINT32_MAX, firstVertexStride = 0, firstVertexFormat = 0;
+        int32_t firstVertexOffset = 0;
         std::vector<TextureBinding> textures;
         std::vector<SamplerBinding> samplers;
 

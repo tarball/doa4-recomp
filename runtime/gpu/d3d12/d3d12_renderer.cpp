@@ -251,6 +251,7 @@ namespace gpu::d3d12
             std::bitset<256> m_reported;
             // DRAW_LOG=first[,count]: logs every draw (and why it was skipped) for those frames.
             uint64_t m_drawLogFirst = UINT64_MAX, m_drawLogCount = 0;
+            uint64_t m_transferLogFirst = UINT64_MAX, m_transferLogCount = 0; // LOG_TRANSFERS=first,count
             // DRAW_LOG_CONSTANTS=first,count[;first,count...]: also logs those float constants (0-255
             // vertex, 256-511 pixel).
             std::vector<std::pair<uint32_t, uint32_t>> m_drawLogConstants;
@@ -266,14 +267,27 @@ namespace gpu::d3d12
             uint32_t m_capturePitch = 0;
             std::vector<uint32_t> m_captureVertexBuffers;
             std::vector<std::string> m_captureVertexShaders;
-            bool CaptureVertexShader() const
+            // Whether the active vertex shader's hash starts with one of these (upper case hex) prefixes.
+            bool VertexShaderMatches(const std::vector<std::string>& prefixes) const
             {
                 if (!m_vertexShader)
                     return false;
                 char hash[17];
                 snprintf(hash, sizeof(hash), "%016llX", (unsigned long long)m_vertexShader->parsed.hash);
-                return std::any_of(m_captureVertexShaders.begin(), m_captureVertexShaders.end(),
+                return std::any_of(prefixes.begin(), prefixes.end(),
                     [&](const std::string& prefix) { return strncmp(hash, prefix.c_str(), prefix.size()) == 0; });
+            }
+            bool CaptureVertexShader() const { return VertexShaderMatches(m_captureVertexShaders); }
+            // DRAW_LOG_FILTER=vADDRESS,sHASH,...: logs only the draws whose first vertex buffer is at one of those physical
+            // addresses (hex) or whose vertex shader's hash starts with one of those prefixes.
+            std::vector<uint32_t> m_drawLogVertexBuffers;
+            std::vector<std::string> m_drawLogVertexShaders;
+            bool DrawLogFilter() const
+            {
+                if (m_drawLogVertexBuffers.empty() && m_drawLogVertexShaders.empty())
+                    return true;
+                return std::find(m_drawLogVertexBuffers.begin(), m_drawLogVertexBuffers.end(), FirstVertexBuffer()) != m_drawLogVertexBuffers.end() ||
+                    VertexShaderMatches(m_drawLogVertexShaders);
             }
             // Physical address of the active vertex shader's first vertex buffer (0 if none).
             uint32_t FirstVertexBuffer() const
@@ -403,11 +417,37 @@ namespace gpu::d3d12
             }
             if (const char* halfPixel = std::getenv(GAME_PREFIX "_HALF_PIXEL"))
                 m_halfPixelOffset = std::atoi(halfPixel) != 0;
+            if (const char* transferLog = std::getenv(GAME_PREFIX "_LOG_TRANSFERS"))
+            {
+                char* end = nullptr;
+                m_transferLogFirst = strtoull(transferLog, &end, 10);
+                m_transferLogCount = (end && *end == ',') ? strtoull(end + 1, nullptr, 10) : 1;
+            }
             if (const char* drawLog = std::getenv(GAME_PREFIX "_DRAW_LOG"))
             {
                 char* end = nullptr;
                 m_drawLogFirst = strtoull(drawLog, &end, 10);
                 m_drawLogCount = (end && *end == ',') ? strtoull(end + 1, nullptr, 10) : 1;
+            }
+            if (const char* filter = std::getenv(GAME_PREFIX "_DRAW_LOG_FILTER"))
+            {
+                for (const char* p = filter; *p;)
+                {
+                    char* end = const_cast<char*>(p + 1);
+                    if (*p == 'v')
+                        m_drawLogVertexBuffers.push_back(uint32_t(strtoul(p + 1, &end, 16)));
+                    else if (*p == 's')
+                    {
+                        while (isxdigit(uint8_t(*end)))
+                            end++;
+                        m_drawLogVertexShaders.emplace_back(p + 1, size_t(end - (p + 1)));
+                        for (char& c : m_drawLogVertexShaders.back())
+                            c = char(toupper(uint8_t(c)));
+                    }
+                    while (*end && *end != ',')
+                        end++;
+                    p = *end ? end + 1 : end;
+                }
             }
             if (const char* constants = std::getenv(GAME_PREFIX "_DRAW_LOG_CONSTANTS"))
             {
@@ -803,8 +843,10 @@ namespace gpu::d3d12
 
         void D3D12Renderer::Draw(const DrawCommand& draw)
         {
+            m_renderTargets.logTransfers = DrawLogging() || (m_frameNumber >= m_transferLogFirst && m_frameNumber < m_transferLogFirst + m_transferLogCount);
+            m_renderTargets.frameNumber = m_frameNumber;
             const char* outcome = DrawInternal(draw);
-            if (DrawLogging())
+            if (DrawLogging() && DrawLogFilter())
                 LogDraw(draw, outcome);
             if (m_frameNumber >= m_summaryFirst && m_frameNumber < m_summaryFirst + m_summaryCount)
             {
@@ -1286,7 +1328,58 @@ namespace gpu::d3d12
 
             // Record: in a render pass with the targets (after the uploads and texture loads above).
             profile::ScopedZone recordZone(profile::Zone::kDrawRecord);
-            m_renderTargets.Bind(list, targets);
+            // The area the draw can touch, for EDRAM ownership: the scissor, within the viewport when it applies. Clears
+            // and blits draw in screen space with a scissor often all of EDRAM: those of a few vertices, with the
+            // position in their first vertex fetch as D3D's have, are within their vertices' bounding box.
+            int32_t areaLeft = left, areaTop = top, areaRight = right, areaBottom = bottom;
+            const uint32_t firstFormat = vs->parsed.firstVertexFormat;
+            if ((vte & 0xF) == 0xF)
+            {
+                areaLeft = std::max(areaLeft, int32_t(std::floor(offset[0] - std::abs(scale[0]))));
+                areaRight = std::min(areaRight, int32_t(std::ceil(offset[0] + std::abs(scale[0]))));
+                areaTop = std::max(areaTop, int32_t(std::floor(offset[1] - std::abs(scale[1]))));
+                areaBottom = std::min(areaBottom, int32_t(std::ceil(offset[1] + std::abs(scale[1]))));
+            }
+            else if ((vte & 0xF) == 0 && vs->parsed.firstVertexConstant != UINT32_MAX && draw.initiator.SourceSelect() == 2 &&
+                     draw.initiator.NumIndices() <= 6 &&
+                     (firstFormat == ucode::kVertex_32_32_FLOAT || firstFormat == ucode::kVertex_32_32_32_FLOAT ||
+                         firstFormat == ucode::kVertex_32_32_32_32_FLOAT))
+            {
+                const uint32_t constant = vs->parsed.firstVertexConstant;
+                const uint32_t d0 = Register(reg::SHADER_CONSTANT_FETCH_00_0 + constant * 2), d1 = Register(reg::SHADER_CONSTANT_FETCH_00_0 + constant * 2 + 1);
+                float minX = INFINITY, minY = INFINITY, maxX = -INFINITY, maxY = -INFINITY;
+                for (uint32_t i = 0; i < draw.initiator.NumIndices(); i++)
+                {
+                    const uint32_t address = (d0 & ~3u) + uint32_t(int32_t(i * vs->parsed.firstVertexStride) + vs->parsed.firstVertexOffset) * 4;
+                    float xy[2];
+                    for (uint32_t c = 0; c < 2; c++)
+                    {
+                        uint32_t raw;
+                        memcpy(&raw, guest::ToHost(guest::PhysicalToGuest(address + c * 4)), 4);
+                        switch (d1 & 3)
+                        {
+                        case 1: raw = ((raw & 0x00FF00FF) << 8) | ((raw >> 8) & 0x00FF00FF); break;
+                        case 2: raw = __builtin_bswap32(raw); break;
+                        case 3: raw = (raw << 16) | (raw >> 16); break;
+                        default: break;
+                        }
+                        memcpy(&xy[c], &raw, 4);
+                    }
+                    minX = std::min(minX, xy[0]);
+                    maxX = std::max(maxX, xy[0]);
+                    minY = std::min(minY, xy[1]);
+                    maxY = std::max(maxY, xy[1]);
+                }
+                if (minX >= -16384.0f && maxX <= 16384.0f && minY >= -16384.0f && maxY <= 16384.0f)
+                {
+                    areaLeft = std::max(areaLeft, int32_t(std::floor(minX)) + windowX);
+                    areaRight = std::min(areaRight, int32_t(std::ceil(maxX)) + windowX);
+                    areaTop = std::max(areaTop, int32_t(std::floor(minY)) + windowY);
+                    areaBottom = std::min(areaBottom, int32_t(std::ceil(maxY)) + windowY);
+                }
+            }
+            m_renderTargets.Bind(list, m_upload, targets, uint32_t(areaLeft), uint32_t(areaTop), uint32_t(std::max(areaRight, areaLeft)),
+                uint32_t(std::max(areaBottom, areaTop)));
             list->SetGraphicsRootSignature(m_pipelines.RootSignature());
             list->SetPipelineState(pipeline);
             list->SetGraphicsRootConstantBufferView(kRootSystemConstants, systemConstants);
@@ -1360,9 +1453,10 @@ namespace gpu::d3d12
             append("[draw] f%llu #%u %s: prim %u x%u src %u%s mode %u vs %016llX ps %016llX", (unsigned long long)m_frameNumber, m_drawIndex, outcome,
                 draw.initiator.PrimitiveType(), draw.initiator.NumIndices(), draw.initiator.SourceSelect(), draw.initiator.Index32() ? " (32)" : "", mode,
                 (unsigned long long)(m_vertexShader ? m_vertexShader->parsed.hash : 0), (unsigned long long)(m_pixelShader ? m_pixelShader->parsed.hash : 0));
-            append(" | rt pitch %u msaa %u color %03X/%u depth %03X/%u ctl %08X mask %04X blend %08X cc %08X ref %g", surface & 0x3FFF, (surface >> 16) & 3,
-                color & 0xFFF, (color >> 16) & 0xF, depth & 0xFFF, (depth >> 16) & 1, Register(reg::RB_DEPTHCONTROL), Register(reg::RB_COLOR_MASK),
-                Register(reg::RB_BLENDCONTROL0), Register(reg::RB_COLORCONTROL), RegisterFloat(reg::RB_ALPHA_REF));
+            append(" | rt pitch %u msaa %u color %03X/%u depth %03X/%u ctl %08X mask %04X blend %08X cc %08X ref %g stencil %06X/%06X", surface & 0x3FFF,
+                (surface >> 16) & 3, color & 0xFFF, (color >> 16) & 0xF, depth & 0xFFF, (depth >> 16) & 1, Register(reg::RB_DEPTHCONTROL),
+                Register(reg::RB_COLOR_MASK), Register(reg::RB_BLENDCONTROL0), Register(reg::RB_COLORCONTROL), RegisterFloat(reg::RB_ALPHA_REF),
+                Register(reg::RB_STENCILREFMASK) & 0xFFFFFF, Register(reg::RB_STENCILREFMASK_BF) & 0xFFFFFF);
             append(" | clip %08X woff %08X sc %08X-%08X su %08X vte %08X vp %g %g %g %g", Register(reg::PA_CL_CLIP_CNTL), Register(reg::PA_SC_WINDOW_OFFSET),
                 Register(reg::PA_SC_WINDOW_SCISSOR_TL), Register(reg::PA_SC_WINDOW_SCISSOR_BR), Register(reg::PA_SU_SC_MODE_CNTL), Register(reg::PA_CL_VTE_CNTL),
                 RegisterFloat(reg::PA_CL_VPORT_XSCALE), RegisterFloat(reg::PA_CL_VPORT_XOFFSET), RegisterFloat(reg::PA_CL_VPORT_YSCALE),
@@ -1410,7 +1504,9 @@ namespace gpu::d3d12
                     for (uint32_t i = 0; i < std::min(size, 1u << 20); i++)
                         hash = (hash ^ *guest::ToHost(vertex + i)) * 16777619u;
                     append(" hash %08X (at %08X):", hash, vertex);
-                    for (uint32_t i = 0; i < 6; i++)
+                    // (Rectangle lists, as clears draw: the three vertices, up to 24 dwords.)
+                    const uint32_t shown = draw.initiator.PrimitiveType() == 8 ? std::min(size / 4, 24u) : 6u;
+                    for (uint32_t i = 0; i < shown; i++)
                     {
                         const uint32_t value = guest::LoadU32(vertex + i * 4);
                         float asFloat;
@@ -1730,6 +1826,7 @@ namespace gpu::d3d12
             }
 
             debug::FloatSearchOnFrame(m_frameNumber);
+            debug::WatchChangesOnFrame(m_frameNumber);
             debug::WriteWatchOnFrame(m_frameNumber);
             audit::Frame(m_frameNumber);
             // Frames that waited for new pipelines (the driver compiling their shaders): hitches.
@@ -1752,12 +1849,26 @@ namespace gpu::d3d12
             const uint32_t* counts = reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(data) + range.Begin);
             for (uint32_t slot = 0; slot < shader::kDebugCountSlots; slot++)
             {
-                const uint32_t* entry = counts + slot * 8;
-                uint32_t* logged = m_debugCountsLogged.data() + slot * 8;
-                if (entry[3] == logged[3] && entry[4] == logged[4] && entry[7] == logged[7])
+                const uint32_t* entry = counts + slot * shader::kDebugSlotDwords;
+                uint32_t* logged = m_debugCountsLogged.data() + slot * shader::kDebugSlotDwords;
+                if (entry[3] == logged[3] && entry[4] == logged[4] && entry[7] == logged[7] && entry[8] == logged[8] && entry[9] == logged[9])
                     continue;
                 const uint32_t flags = entry[2];
-                auto kinds = [flags](std::initializer_list<std::pair<uint32_t, const char*>> names) {
+                // The interpolator components seen non-finite, as "interpolators 3.w 5.xyzw".
+                std::string interpolators = "interpolators";
+                for (uint32_t n = 0; n < 16; n++)
+                {
+                    const uint32_t bits = (entry[8 + (n >> 3)] >> ((n & 7) * 4)) & 0xF;
+                    if (!bits)
+                        continue;
+                    interpolators += " " + std::to_string(n) + ".";
+                    for (uint32_t c = 0; c < 4; c++)
+                    {
+                        if (bits & (1u << c))
+                            interpolators += "xyzw"[c];
+                    }
+                }
+                auto kinds = [flags](std::initializer_list<std::pair<uint32_t, std::string>> names) {
                     std::string text;
                     for (const auto& [bit, name] : names)
                     {
@@ -1769,14 +1880,14 @@ namespace gpu::d3d12
                 LOG_INFO("DEBUG_NAN: by frame %llu, %s_%08X%08X: %u invocations with a product of 0 and infinity or NaN (ALU instructions %u-%u), "
                          "%u with non-finite outputs%s, %u with non-finite inputs%s",
                     (unsigned long long)m_frameNumber, (flags & 1) ? "ps" : "vs", entry[1], entry[0], entry[3], 0xFFFFu - entry[5], entry[6], entry[4],
-                    kinds({ { shader::kDebugNonFinitePosition, "position" }, { shader::kDebugNonFiniteExports, "interpolators" },
+                    kinds({ { shader::kDebugNonFinitePosition, "position" }, { shader::kDebugNonFiniteExports, interpolators },
                         { shader::kDebugNonFiniteColor, "color or depth" } })
                         .c_str(),
                     entry[7],
-                    kinds({ { shader::kDebugNonFiniteVertexData, "vertex data" }, { shader::kDebugNonFiniteInterpolators, "interpolators" },
+                    kinds({ { shader::kDebugNonFiniteVertexData, "vertex data" }, { shader::kDebugNonFiniteInterpolators, interpolators },
                         { shader::kDebugNonFiniteTexels, "texels" } })
                         .c_str());
-                memcpy(logged, entry, 32);
+                memcpy(logged, entry, shader::kDebugSlotDwords * 4);
             }
             const D3D12_RANGE written{ 0, 0 };
             m_debugCountsReadback->Unmap(0, &written);

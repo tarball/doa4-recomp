@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 struct PPCFuncMapping;
 
@@ -18,4 +19,9 @@ namespace crash
     uint32_t GuestFunctionAt(uintptr_t hostPc);
     // The recompiled guest function containing a guest code address: the nearest one starting at or below it (0 if none).
     uint32_t GuestFunctionContaining(uint32_t guestAddress);
+
+    // Ends the game after something it can't go on from (an error the game itself treats as fatal, an import the runtime
+    // doesn't implement): logs `message` and the calling guest thread's backtrace, shows the message in a message box
+    // unless the game runs headless, and exits with code 1.
+    [[noreturn]] void Fatal(const std::string& message);
 }

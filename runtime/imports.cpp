@@ -4,6 +4,7 @@
 // normal (strong) definition of __imp__<Name> in another file; the linker then picks it over the stub.
 #include "imports.h"
 
+#include "crash_handler.h"
 #include "guest_abi.h"
 #include "guest_memory.h"
 #include "kernel/threads.h"
@@ -24,9 +25,7 @@ namespace
     [[noreturn]] __attribute__((noinline)) void UnimplementedImport(const char* name, const PPCContext& ctx)
     {
         fprintf(stderr, "Unimplemented import %s, called from 0x%08X\n", name, uint32_t(ctx.lr));
-        guest::PrintBacktrace(ctx.r1.u32);
-        fflush(stderr);
-        abort();
+        crash::Fatal(std::string("The game called ") + name + ", which this runtime doesn't implement, and can't go on.");
     }
 }
 
@@ -146,6 +145,17 @@ namespace imports
     {
         const auto it = g_variables.find(name);
         return it != g_variables.end() ? it->second : 0;
+    }
+
+    uint32_t FunctionThunk(std::string_view library, uint32_t ordinal)
+    {
+#define IMPORT_FUNC(lib, importOrdinal, name, thunk, slot) \
+        if (library == #lib && ordinal == importOrdinal) return thunk;
+#define IMPORT_VAR(lib, ordinal, name, slot)
+#include "imports.inc"
+#undef IMPORT_FUNC
+#undef IMPORT_VAR
+        return 0;
     }
 
     void RegisterThunks()

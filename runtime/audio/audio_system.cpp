@@ -86,6 +86,20 @@ namespace audio
             std::atomic<uint32_t> m_bytes{ 0 };
         };
 
+        // XAudio2 stops for good when its device goes away (unplugged or switched, or a remote session's audio
+        // reconnecting), and says so here.
+        class EngineCallback : public IXAudio2EngineCallback
+        {
+        public:
+            void STDMETHODCALLTYPE OnProcessingPassStart() noexcept override {}
+            void STDMETHODCALLTYPE OnProcessingPassEnd() noexcept override {}
+            void STDMETHODCALLTYPE OnCriticalError(HRESULT error) noexcept override { m_error = uint32_t(error); }
+            uint32_t Error() const { return m_error; }
+
+        private:
+            std::atomic<uint32_t> m_error{ 0 };
+        };
+
         // One host output voice per client, fed with interleaved little-endian floats.
         class Output
         {
@@ -96,6 +110,7 @@ namespace audio
                     m_comFallback = true; // already initialized differently; XAudio2 still works
                 if (FAILED(XAudio2Create(&m_xaudio, 0, XAUDIO2_DEFAULT_PROCESSOR)))
                     return false;
+                m_xaudio->RegisterForCallbacks(&m_callback);
                 if (FAILED(m_xaudio->CreateMasteringVoice(&m_master)))
                     return false;
 
@@ -136,6 +151,9 @@ namespace audio
                 return state.BuffersQueued;
             }
 
+            // The critical error that stopped the engine, or 0.
+            uint32_t Error() const { return m_callback.Error(); }
+
             void Submit(const float* planarBigEndian)
             {
                 float* out = m_buffers[m_next].data();
@@ -158,6 +176,7 @@ namespace audio
             }
 
         private:
+            EngineCallback m_callback; // outlives the engine, released first in the destructor
             IXAudio2* m_xaudio = nullptr;
             IXAudio2MasteringVoice* m_master = nullptr;
             IXAudio2SourceVoice* m_voice = nullptr;
@@ -173,7 +192,19 @@ namespace audio
             uint32_t callbackArgument = 0;
             std::atomic<int> pending{ 0 }; // callbacks posted but not yet answered with a frame
             std::unique_ptr<Output> output;
+            // Without host output: when the next frame is due (real time), and when to try opening the output again.
+            std::chrono::steady_clock::time_point nextFrame{}, retry{};
         };
+
+        // Opens a client's host output. Returns whether it has one; without, it runs silently in real time.
+        bool OpenOutput(Client& client)
+        {
+            auto output = std::make_unique<Output>();
+            if (!output->Initialize())
+                return false;
+            client.output = std::move(output);
+            return true;
+        }
 
         struct State
         {
@@ -190,7 +221,8 @@ namespace audio
         }
 
         // Asks each client for frames, keeping each host voice kQueueDepth frames ahead. Without
-        // host output, frames are requested at the real-time rate instead.
+        // host output, frames are requested at the real-time rate instead, and the output is reopened
+        // every 2 s (it's lost when its device goes away).
         void DriverThread()
         {
             using namespace std::chrono;
@@ -202,13 +234,38 @@ namespace audio
             {
                 nextTick += framePeriod / 2;
                 std::this_thread::sleep_until(nextTick);
+                const auto now = steady_clock::now();
 
                 std::lock_guard lock(state.lock);
                 for (Client& client : state.clients)
                 {
-                    if (!client.active || client.pending > 0)
+                    if (!client.active)
                         continue;
-                    const bool wanted = client.output ? client.output->Queued() < kQueueDepth : true;
+                    if (client.output && client.output->Error())
+                    {
+                        LOG_WARN("Audio: host output lost (XAudio2 error 0x%08X); running silently until it's back", client.output->Error());
+                        client.output.reset();
+                        client.retry = now;
+                        client.nextFrame = now;
+                    }
+                    if (!client.output && now >= client.retry)
+                    {
+                        if (OpenOutput(client))
+                            LOG_INFO("Audio: host output is back");
+                        else
+                            client.retry = now + seconds(2);
+                    }
+                    if (client.pending > 0)
+                        continue;
+                    bool wanted;
+                    if (client.output)
+                        wanted = client.output->Queued() < kQueueDepth;
+                    else
+                    {
+                        wanted = now >= client.nextFrame;
+                        if (wanted)
+                            client.nextFrame = std::max(client.nextFrame + framePeriod, now - kQueueDepth * framePeriod);
+                    }
                     if (wanted)
                     {
                         client.pending++;
@@ -239,12 +296,10 @@ namespace audio
             client.callback = callback;
             client.callbackArgument = callbackArgument;
             client.pending = 0;
-            client.output = std::make_unique<Output>();
-            if (!client.output->Initialize())
-            {
-                LOG_WARN("Audio: no host output (XAudio2 unavailable); running silently in real time");
-                client.output.reset();
-            }
+            client.nextFrame = std::chrono::steady_clock::now();
+            client.retry = client.nextFrame + std::chrono::seconds(2);
+            if (!OpenOutput(client))
+                LOG_WARN("Audio: no host output (XAudio2 unavailable); running silently in real time until there is");
             LOG_INFO("Audio: client %d registered (callback 0x%08X, argument 0x%08X)", i, callback, callbackArgument);
             return i;
         }
@@ -268,12 +323,23 @@ namespace audio
         return dump ? dump->Seconds() : -1.0;
     }
 
+    namespace
+    {
+        std::atomic<uint64_t> g_submittedFrames{ 0 };
+    }
+
+    uint64_t SubmittedFrames()
+    {
+        return g_submittedFrames;
+    }
+
     void SubmitFrame(int index, uint32_t samples)
     {
         State& state = GetState();
         std::lock_guard lock(state.lock);
         if (index < 0 || index >= kMaxClients || !state.clients[index].active)
             return;
+        g_submittedFrames++;
         Client& client = state.clients[index];
         if (client.pending > 0)
             client.pending--;

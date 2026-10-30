@@ -12,6 +12,7 @@
 #include "vfs/vfs.h"
 #include "xam/xam.h"
 
+#include <algorithm>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -86,6 +87,54 @@ namespace
         std::mutex lock;
     };
 
+    // An enumeration an XAM app serves (XamCreateEnumeratorHandle; DOAX2's XMP library asks for the user's playlists): its
+    // guest object is a 24-byte header (app, open and close messages, user, items per call, flags) and `extraSize` bytes
+    // the title and the app share (XamGetPrivateEnumStructureFromHandle). The runtime's apps have nothing to enumerate.
+    class AppEnumerator : public Enumerator
+    {
+    public:
+        AppEnumerator(uint32_t itemsPerCall, uint32_t extraSize) : Enumerator(1, itemsPerCall), m_address(guest::SystemAlloc(24 + extraSize)) {}
+        ~AppEnumerator() override
+        {
+            if (m_address)
+                guest::SystemFree(m_address);
+        }
+        uint32_t GuestObject() const override { return m_address; }
+        bool IsWaitable() const override { return false; }
+
+    private:
+        uint32_t m_address; // (zeroed)
+    };
+
+    uint32_t XamCreateEnumeratorHandle(uint32_t userIndex, uint32_t appId, uint32_t openMessage, uint32_t closeMessage, uint32_t extraSize,
+        uint32_t itemsPerCall, uint32_t flags, be<uint32_t>* handle)
+    {
+        if (!handle || extraSize > 0x100000)
+            return xam::kErrorInvalidParameter;
+        auto enumerator = std::make_shared<AppEnumerator>(std::max(itemsPerCall, 1u), extraSize);
+        const uint32_t header = enumerator->GuestObject();
+        if (!header)
+            return xam::kErrorNotEnoughMemory;
+        const uint32_t fields[6] = { appId, openMessage, closeMessage, userIndex, itemsPerCall, flags };
+        for (uint32_t i = 0; i < 6; i++)
+            guest::StoreU32(header + i * 4, fields[i]);
+        LOG_INFO("XamCreateEnumeratorHandle(app 0x%X, messages 0x%X/0x%X, %u items, %u bytes shared): nothing to enumerate", appId, openMessage,
+            closeMessage, itemsPerCall, extraSize);
+        *handle = CreateHandle(enumerator);
+        return xam::kErrorSuccess;
+    }
+
+    // The guest object of an enumerator from XamCreateEnumeratorHandle, with a reference ObDereferenceObject releases.
+    uint32_t XamGetPrivateEnumStructureFromHandle(uint32_t handle, be<uint32_t>* structure)
+    {
+        if (!LookupHandleAs<AppEnumerator>(handle))
+            return 0xC0000008; // STATUS_INVALID_HANDLE
+        const uint32_t object = kernel::ReferenceObject(handle);
+        if (structure)
+            *structure = object;
+        return 0;
+    }
+
     uint32_t XamContentCreateEnumerator(uint32_t userIndex, uint32_t deviceId, uint32_t contentType, uint32_t /*contentFlags*/,
         uint32_t itemsPerCall, be<uint32_t>* bufferSize, be<uint32_t>* handle)
     {
@@ -140,7 +189,10 @@ namespace
             count++;
         }
 
-        const uint32_t result = count ? xam::kErrorSuccess : xam::kErrorNoMoreFiles;
+        // An app's enumeration ends with success and no items: DOAX2's radio menu waits on its XMP enumeration until
+        // XGetOverlappedResult gives 0, then takes no items as the end. Content enumerations end with no more files.
+        const bool appEnumeration = std::dynamic_pointer_cast<AppEnumerator>(enumerator) != nullptr;
+        const uint32_t result = count || appEnumeration ? xam::kErrorSuccess : xam::kErrorNoMoreFiles;
         if (itemsReturned)
         {
             *itemsReturned = count;
@@ -250,6 +302,13 @@ namespace
         return xam::Complete(overlapped, result);
     }
 
+    // Later XDKs' form (DOAX2's): with the cache size and the content's size, which host folders don't need.
+    uint32_t XamContentCreateEx(uint32_t userIndex, const char* rootName, const ContentData* data, uint32_t flags, be<uint32_t>* disposition,
+        be<uint32_t>* licenseMask, uint32_t /*cacheSize*/, uint64_t /*contentSize*/, xam::Overlapped* overlapped)
+    {
+        return XamContentCreate(userIndex, rootName, data, flags, disposition, licenseMask, overlapped);
+    }
+
     uint32_t XamContentClose(const char* rootName, xam::Overlapped* overlapped)
     {
         std::lock_guard lock(g_openLock);
@@ -347,9 +406,22 @@ namespace
     }
 }
 
+namespace xam
+{
+    uint32_t CreateEnumerator(uint32_t itemSize, uint32_t itemsPerCall, std::vector<std::vector<uint8_t>> items)
+    {
+        auto enumerator = std::make_shared<Enumerator>(std::max(itemSize, 1u), std::max(itemsPerCall, 1u));
+        enumerator->items = std::move(items);
+        return CreateHandle(enumerator);
+    }
+}
+
 GUEST_EXPORT(XamContentCreateEnumerator, XamContentCreateEnumerator)
+GUEST_EXPORT(XamCreateEnumeratorHandle, XamCreateEnumeratorHandle)
+GUEST_EXPORT(XamGetPrivateEnumStructureFromHandle, XamGetPrivateEnumStructureFromHandle)
 GUEST_EXPORT(XamEnumerate, XamEnumerate)
 GUEST_EXPORT(XamContentCreate, XamContentCreate)
+GUEST_EXPORT(XamContentCreateEx, XamContentCreateEx)
 GUEST_EXPORT(XamContentClose, XamContentClose)
 GUEST_EXPORT(XamContentDelete, XamContentDelete)
 GUEST_EXPORT(XamContentGetCreator, XamContentGetCreator)

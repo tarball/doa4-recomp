@@ -18,7 +18,7 @@ namespace debug
         struct Step
         {
             uint64_t frame;
-            float lo, hi;
+            float lo, hi; // "nan" for both: a computed NaN (the default quiet NaN, either sign: x86's or PowerPC's)
         };
 
         struct Search
@@ -58,6 +58,14 @@ namespace debug
             float value;
             memcpy(&value, &bits, 4);
             return value;
+        }
+
+        bool Matches(const Step& step, uint32_t address)
+        {
+            if (step.lo != step.lo)
+                return (guest::LoadU32(address) & 0x7FFFFFFFu) == 0x7FC00000u;
+            const float value = LoadFloat(address);
+            return value >= step.lo && value <= step.hi;
         }
 
         // Every committed, readable guest word below 0xC0000000 (C0000000-DFFFFFFF aliases A0000000-BFFFFFFF,
@@ -102,11 +110,10 @@ namespace debug
             if (search.next == 0)
             {
                 ForEachGuestWord([&](uint32_t address) {
-                    const float value = LoadFloat(address);
-                    if (value >= step.lo && value <= step.hi)
+                    if (Matches(step, address))
                     {
                         search.candidates.push_back(address);
-                        search.values.push_back({ value });
+                        search.values.push_back({ LoadFloat(address) });
                     }
                 });
             }
@@ -116,7 +123,7 @@ namespace debug
                 for (size_t i = 0; i < search.candidates.size(); i++)
                 {
                     const float value = LoadFloat(search.candidates[i]);
-                    if (!(value >= step.lo && value <= step.hi))
+                    if (!Matches(step, search.candidates[i]))
                         continue;
                     search.candidates[kept] = search.candidates[i];
                     search.values[kept] = std::move(search.values[i]);
@@ -130,13 +137,43 @@ namespace debug
             LOG_INFO("float search %zu: frame %llu: %zu candidates", index, static_cast<unsigned long long>(frame), search.candidates.size());
             if (search.next < search.steps.size())
                 continue;
-            for (size_t i = 0; i < search.candidates.size() && i < 200; i++)
+            for (size_t i = 0; i < search.candidates.size() && i < 5000; i++)
             {
                 std::string line;
                 for (const float value : search.values[i])
                     line += " " + std::to_string(value);
                 LOG_INFO("float search %zu: %08X:%s", index, search.candidates[i], line.c_str());
             }
+        }
+    }
+
+    void WatchChangesOnFrame(uint64_t frame)
+    {
+        struct Watch
+        {
+            uint32_t address, value;
+        };
+        static std::vector<Watch> watches = [] {
+            std::vector<Watch> parsed;
+            if (const char* setting = std::getenv(GAME_PREFIX "_DEBUG_WATCH_CHANGES"))
+            {
+                for (const char* p = setting; *p;)
+                {
+                    char* end = nullptr;
+                    const uint32_t address = uint32_t(strtoul(p, &end, 16)) & ~3u;
+                    parsed.push_back({ address, guest::LoadU32(address) });
+                    p = *end ? end + 1 : end;
+                }
+            }
+            return parsed;
+        }();
+        for (Watch& watch : watches)
+        {
+            const uint32_t value = guest::LoadU32(watch.address);
+            if (value == watch.value)
+                continue;
+            LOG_INFO("watch: frame %llu: [%08X] %08X -> %08X", static_cast<unsigned long long>(frame), watch.address, watch.value, value);
+            watch.value = value;
         }
     }
 }

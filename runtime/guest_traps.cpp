@@ -1,4 +1,5 @@
 // Guest traps and jump table indices out of range, which the generated code reports (see ppc_overrides.h).
+#include "crash_handler.h"
 #include "guest_abi.h"
 #include "log.h"
 
@@ -64,9 +65,11 @@ void GuestTrap(PPCContext& ctx, uint8_t* base, uint32_t address, uint32_t instru
     guest::PrintBacktrace(ctx.r1.u32, 8);
 }
 
-// PPC_SWITCH_OUT_OF_RANGE: a jump table's index beyond the table, which the guest's bounds check should have excluded.
+// PPC_SWITCH_OUT_OF_RANGE: a jump table's index beyond the table, which the guest's bounds check should have excluded. The
+// game ends with a message (crash::Fatal), as for the other errors it can't go on from.
 [[noreturn]] void GuestSwitchOutOfRange(uint32_t address, uint32_t index)
 {
-    LOG_ERROR("Jump table at %08X: index %u is beyond the table", address, index);
-    std::abort();
+    char message[160];
+    snprintf(message, sizeof(message), "Jump table at %08X: index %u is beyond the table, and the game can't go on.", address, index);
+    crash::Fatal(message);
 }

@@ -19,4 +19,7 @@ namespace audio
     // With AUDIO_DUMP, how many seconds of audio the dump holds so far (else -1): frame dumps log it, to
     // line pictures up with sound.
     double DumpedSeconds();
+
+    // Frames clients have submitted (the status line shows it: the game's audio clock, which movies follow).
+    uint64_t SubmittedFrames();
 }

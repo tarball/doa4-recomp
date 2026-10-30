@@ -807,6 +807,8 @@ namespace gpu
                 static constexpr uint32_t kBases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
                 const uint32_t type = (offsetType >> 16) & 0xFF;
                 const uint32_t base = type < 5 ? kBases[type] : 0x2000;
+                if (Tracing())
+                    fprintf(stderr, "[gpu] SET_CONSTANT %u dwords to register %04X\n", count - 1, base + index);
                 for (uint32_t i = 1; i < count; i++)
                     WriteRegister(base + index + i - 1, read());
                 break;
@@ -828,6 +830,8 @@ namespace gpu
                 static constexpr uint32_t kBases[] = { 0x4000, 0x4800, 0x4900, 0x4908, 0x2000 };
                 const uint32_t type = (offsetType >> 16) & 0xFF;
                 const uint32_t base = type < 5 ? kBases[type] : 0x2000;
+                if (Tracing())
+                    fprintf(stderr, "[gpu] LOAD_ALU_CONSTANT %08X: %u dwords to register %04X\n", address, size, base + index);
                 for (uint32_t i = 0; i < size; i++)
                     WriteRegister(base + index + i, LoadPhysical(address + i * 4));
                 break;

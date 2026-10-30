@@ -230,6 +230,18 @@ namespace
             guest::SystemFree(address);
         return xerror::kSuccess;
     }
+
+    // The kernel's pool, from the runtime's system heap (whole pages; XAPI only uses it for a file copy's buffer).
+    uint32_t ExAllocatePool(uint32_t size)
+    {
+        return size ? guest::SystemAlloc(size) : 0;
+    }
+
+    void ExFreePool(uint32_t address)
+    {
+        if (address)
+            guest::SystemFree(address);
+    }
 }
 
 GUEST_EXPORT(NtAllocateVirtualMemory, NtAllocateVirtualMemory)
@@ -242,3 +254,5 @@ GUEST_EXPORT(MmQueryAddressProtect, MmQueryAddressProtect)
 GUEST_EXPORT(MmSetAddressProtect, MmSetAddressProtect)
 GUEST_EXPORT(XamAlloc, XamAlloc)
 GUEST_EXPORT(XamFree, XamFree)
+GUEST_EXPORT(ExAllocatePool, ExAllocatePool)
+GUEST_EXPORT(ExFreePool, ExFreePool)

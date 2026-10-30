@@ -1,7 +1,7 @@
 #pragma once
 
 // The game's code module (<executable>_ppc.dll, doa4_ppc.dll): the recompiled code, which isn't in the executable but
-// built from the player's own game, with clang and lld alone (ANALYSIS.md, Phase 5, The game's code module). This
+// in a module of its own beside it, built with clang and lld alone (ANALYSIS.md, Phase 5, The game's code module). This
 // header is shared by the module (module.cpp) and the executable (loader.cpp): what the module tells the executable
 // about itself, exported as PPCModule, which the loader checks against what it was compiled with before running any of
 // the module's code.

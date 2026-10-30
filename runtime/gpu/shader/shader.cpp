@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <functional>
+#include <queue>
 
 namespace gpu::shader
 {
@@ -25,17 +27,33 @@ namespace gpu::shader
                                       : 0u;
         };
         std::vector<ShaderBinary> binaries;
-        for (size_t offset = 0; offset + 0x20 <= size; offset += 4)
+        for (size_t offset = 0; offset + 0x24 <= size; offset += 4)
         {
             const uint32_t magic = load(offset);
             if ((magic & 0xFFFFFF00) != 0x102A0E00 && (magic & 0xFFFFFF00) != 0x102A1100)
                 continue;
-            // The microcode: whole instructions (3 dwords each), after the header.
-            const uint32_t ucodeOffset = load(offset + 4), ucodeSize = load(offset + 8);
-            if (!ucodeSize || ucodeSize % 12 || ucodeOffset < 0x18 || ucodeOffset % 4 || ucodeOffset > 0x10000 || ucodeSize > 0x40000 ||
-                offset + ucodeOffset + ucodeSize > size)
-                continue;
             if ((magic & 0xFF) > 1)
+                continue;
+            // The microcode: whole instructions (3 dwords each). In the older container (DOA4's, 0x102A0E0x) the header
+            // gives its offset and size. In the newer one (DOAX2's, 0x102A110x, as XenosRecomp reads it), the header is
+            // { flags, virtual size, physical size, ?, constant table, definition table, shader offset, ?, ? } and the
+            // shader record at its offset starts with the microcode's offset after the virtual part, and its size.
+            uint32_t ucodeOffset, ucodeSize;
+            if ((magic & 0xFFFFFF00) == 0x102A1100)
+            {
+                const uint32_t virtualSize = load(offset + 4), shaderOffset = load(offset + 0x18);
+                if (!shaderOffset || shaderOffset % 4 || shaderOffset > 0x10000 || offset + shaderOffset + 8 > size || virtualSize > 0x100000)
+                    continue;
+                ucodeOffset = virtualSize + load(offset + shaderOffset);
+                ucodeSize = load(offset + shaderOffset + 4);
+            }
+            else
+            {
+                ucodeOffset = load(offset + 4);
+                ucodeSize = load(offset + 8);
+            }
+            if (!ucodeSize || ucodeSize % 12 || ucodeOffset < 0x18 || ucodeOffset % 4 || ucodeOffset > 0x110000 || ucodeSize > 0x40000 ||
+                offset + ucodeOffset + ucodeSize > size)
                 continue;
             ShaderBinary& binary = binaries.emplace_back();
             binary.offset = offset;
@@ -290,6 +308,13 @@ namespace gpu::shader
                 if (!fetch.VertexMiniFetch())
                 {
                     const uint32_t constant = fetch.VertexConstantIndex();
+                    if (shader.firstVertexConstant == UINT32_MAX)
+                    {
+                        shader.firstVertexConstant = constant;
+                        shader.firstVertexStride = fetch.VertexStride();
+                        shader.firstVertexOffset = fetch.VertexOffset();
+                        shader.firstVertexFormat = fetch.VertexFormat();
+                    }
                     if (std::find(shader.vertexFetchConstants.begin(), shader.vertexFetchConstants.end(), constant) == shader.vertexFetchConstants.end())
                         shader.vertexFetchConstants.push_back(constant);
                 }
@@ -315,6 +340,64 @@ namespace gpu::shader
                 break;
             }
         }
+
+        // For a shader with jumps but no loops or calls: an order of its CF instructions in which each comes after every
+        // instruction that can lead to it (where control falls through or jumps), into shader.forwardOrder. The lowest
+        // index goes first wherever the order allows, so shaders whose jumps all go forward keep their own order. Jumps
+        // back that never close a cycle (an else block after the end that jumps back to the code after the if, as in 271
+        // of DOA4's shaders) are fine. Returns false if the instructions form a cycle.
+        bool OrderForward(ParsedShader& shader)
+        {
+            const uint32_t count = uint32_t(shader.cf.size());
+            std::vector<std::vector<uint32_t>> successors(count);
+            std::vector<uint32_t> predecessors(count, 0);
+            for (uint32_t index = 0; index < count; index++)
+            {
+                const CfInstruction& cf = shader.cf[index];
+                std::vector<uint32_t>& next = successors[index];
+                switch (cf.Opcode())
+                {
+                case CfOpcode::kCondJmp:
+                    next.push_back(cf.TargetAddress());
+                    if (!cf.IsUnconditional())
+                        next.push_back(index + 1);
+                    break;
+                case CfOpcode::kExec:
+                case CfOpcode::kExecEnd:
+                    if (!cf.IsEnd())
+                        next.push_back(index + 1);
+                    break;
+                default: // (conditional execs go on whether or not they end the shader)
+                    next.push_back(index + 1);
+                    break;
+                }
+                next.erase(std::remove_if(next.begin(), next.end(), [count](uint32_t target) { return target >= count; }), next.end());
+                for (uint32_t target : next)
+                    predecessors[target]++;
+            }
+            std::priority_queue<uint32_t, std::vector<uint32_t>, std::greater<uint32_t>> ready;
+            for (uint32_t index = 0; index < count; index++)
+            {
+                if (!predecessors[index])
+                    ready.push(index);
+            }
+            shader.forwardOrder.clear();
+            while (!ready.empty())
+            {
+                const uint32_t index = ready.top();
+                ready.pop();
+                shader.forwardOrder.push_back(index);
+                for (uint32_t target : successors[index])
+                {
+                    if (--predecessors[target] == 0)
+                        ready.push(target);
+                }
+            }
+            if (shader.forwardOrder.size() == count)
+                return true;
+            shader.forwardOrder.clear();
+            return false;
+        }
     }
 
     ParsedShader Parse(ShaderStage stage, const uint32_t* ucode, uint32_t dwordCount)
@@ -338,14 +421,18 @@ namespace gpu::shader
             }
         }
 
-        for (const CfInstruction& cf : shader.cf)
+        for (size_t index = 0; index < shader.cf.size(); index++)
         {
+            const CfInstruction& cf = shader.cf[index];
             switch (cf.Opcode())
             {
             case CfOpcode::kLoopStart:
             case CfOpcode::kLoopEnd:
             case CfOpcode::kCondCall:
             case CfOpcode::kReturn:
+                shader.structuredControlFlow = false;
+                shader.forwardControlFlow = false;
+                break;
             case CfOpcode::kCondJmp:
                 shader.structuredControlFlow = false;
                 break;
@@ -370,6 +457,8 @@ namespace gpu::shader
                     AnalyzeAlu(shader, AluInstruction{ { words[0], words[1], words[2] } });
             }
         }
+        if (!shader.structuredControlFlow && shader.forwardControlFlow)
+            shader.forwardControlFlow = OrderForward(shader);
         if (shader.relativeTemps)
             shader.tempCount = 64;
         shader.valid = true;

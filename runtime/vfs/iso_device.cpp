@@ -250,6 +250,12 @@ namespace vfs
         uint32_t rootSector, rootSize;
         memcpy(&rootSector, descriptor + 20, 4);
         memcpy(&rootSize, descriptor + 24, 4);
+        // Files' times are the volume's, from when the disc was mastered (the image file's own time if it has none):
+        // the same wherever the image is kept, which matters to a game comparing them with files it copied.
+        uint64_t volumeTime;
+        memcpy(&volumeTime, descriptor + 28, 8);
+        if (volumeTime)
+            image->creationTime = volumeTime;
 
         Node& root = image->nodes[""];
         root.info.isDirectory = true;

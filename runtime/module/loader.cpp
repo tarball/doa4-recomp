@@ -13,7 +13,6 @@
 #include "ppc_config.h"
 #include "ppc_context.h"
 
-#include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -26,10 +25,6 @@
 #include <windows.h>
 #include <bcrypt.h>
 #include <delayimp.h>
-
-#ifndef GAME_LAUNCHER
-#define GAME_LAUNCHER GAME_PREFIX " Launcher.exe" // CMakeLists.txt's
-#endif
 
 namespace module
 {
@@ -135,27 +130,10 @@ namespace module
             return replacements;
         }
 
-        // A release's folder holds recomp\<executable>_ppc.sha256, the SHA-256 every PC's build of the module gives
-        // (runtime/launcher/launcher.h): its text, or empty in a development checkout's build.
-        std::string ReleaseHash()
-        {
-            std::ifstream file(std::filesystem::path(ExecutablePath()).parent_path() / L"recomp" / L"" GAME_EXECUTABLE "_ppc.sha256");
-            std::string hash;
-            if (!(file >> hash))
-                return {};
-            for (char& c : hash)
-                c = char(tolower(static_cast<unsigned char>(c)));
-            return hash;
-        }
-
-        // What to do about a module that's missing or wrong: in a release, start the launcher, which builds it; in a
-        // development checkout, build.cmd.
-        std::string Rebuild()
-        {
-            if (!ReleaseHash().empty())
-                return " Start " GAME_LAUNCHER " in the game's folder: it builds the game's code from your disc image of " GAME_TITLE ".";
-            return " It's built from your disc image of " GAME_TITLE ": build it again (in a development checkout, with build.cmd).";
-        }
+        // What to do about a module that's missing or wrong: it comes with the executable, in a release's folder, or from
+        // build.cmd, in a development checkout.
+        constexpr char kReinstall[] = " It comes with the game: extract the whole release again, to a folder of its own (in a development "
+                                      "checkout, build it with build.cmd).";
 
         // What differs between the module's info and the runtime's, or empty.
         std::string Mismatch(const PPCModuleInfo& module, const PPCModuleInfo& runtime)
@@ -205,7 +183,6 @@ namespace module
 
     std::string Load(Loaded& loaded)
     {
-        const std::string rebuild = Rebuild();
         // The module imports from the executable by its name.
         const std::wstring executable = ExecutablePath();
         if (_wcsicmp(std::filesystem::path(executable).filename().c_str(), L"" GAME_EXECUTABLE ".exe") != 0)
@@ -214,7 +191,7 @@ namespace module
         const std::wstring path = Path();
         std::error_code error;
         if (!std::filesystem::is_regular_file(path, error))
-            return std::string("The game's code, ") + kFileNameA + ", isn't next to " GAME_EXECUTABLE ".exe." + rebuild;
+            return std::string("The game's code, ") + kFileNameA + ", isn't next to " GAME_EXECUTABLE ".exe." + kReinstall;
         g_module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (!g_module)
         {
@@ -224,17 +201,17 @@ namespace module
             for (size_t length = strlen(text); length && (text[length - 1] == '\n' || text[length - 1] == '\r'); length--)
                 text[length - 1] = '\0';
             // 127: it imports a function this executable doesn't export (built for another build of the game).
-            return std::string("Can't load the game's code, ") + kFileNameA + ": " + text + " (error " + std::to_string(code) + ")." + rebuild;
+            return std::string("Can't load the game's code, ") + kFileNameA + ": " + text + " (error " + std::to_string(code) + ")." + kReinstall;
         }
 
         const auto* info = reinterpret_cast<const PPCModuleInfo*>(GetProcAddress(g_module, "PPCModule"));
         if (!info)
-            return std::string(kFileNameA) + " isn't the game's code." + rebuild;
+            return std::string(kFileNameA) + " isn't the game's code." + kReinstall;
         const PPCModuleInfo expected = PPC_MODULE_INFO(nullptr, nullptr);
         if (const std::string mismatch = Mismatch(*info, expected); !mismatch.empty())
         {
             LOG_ERROR("Game code: %s was built for another runtime: %s", kFileNameA, mismatch.c_str());
-            return std::string("The game's code, ") + kFileNameA + ", was built for another build of the game." + rebuild;
+            return std::string("The game's code, ") + kFileNameA + ", was built for another build of the game." + kReinstall;
         }
 
         // A random stack cookie for its /GS checks, before any of its code runs (the C runtime's top 16 bits clear).
@@ -251,7 +228,7 @@ namespace module
             for (const std::string& name : g_missing)
                 LOG_ERROR("Game code: %s doesn't have %s, which the runtime calls", kFileNameA, name.c_str());
             return std::string("The game's code, ") + kFileNameA + ", lacks " + std::to_string(g_missing.size()) +
-                " functions this build of the game calls." + rebuild;
+                " functions this build of the game calls." + kReinstall;
         }
 
         // Every replacement the executable exports must be what the module's code calls: its function table's entry
@@ -276,11 +253,9 @@ namespace module
         }
         if (missed)
             return std::string("The game's code, ") + kFileNameA + ", doesn't call " + std::to_string(missed) +
-                " of this build's replacements of its functions." + rebuild;
+                " of this build's replacements of its functions." + kReinstall;
 
-        // The file's SHA-256: in a release, the release's (every PC builds the same file), which the launcher checks too.
-        // A module the checks above pass can still hold other code, from an earlier release whose code differs but whose
-        // functions are the same.
+        // The file's SHA-256, for the log: which build of the game's code this is.
         std::ifstream file(path, std::ios::binary);
         const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
         loaded.functions = info->functions;
@@ -288,11 +263,6 @@ namespace module
         loaded.replacements = replacements.size();
         LOG_INFO("Game code: %s, %zu bytes, SHA-256 %s: %zu functions, %zu of them the runtime's", kFileNameA, bytes.size(),
             loaded.sha256.c_str(), count, replacements.size());
-        if (const std::string release = ReleaseHash(); !release.empty() && release != loaded.sha256)
-        {
-            LOG_ERROR("Game code: %s isn't this release's (SHA-256 %s)", kFileNameA, release.c_str());
-            return std::string("The game's code, ") + kFileNameA + ", isn't this release's." + rebuild;
-        }
         return {};
     }
 }

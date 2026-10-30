@@ -1,16 +1,14 @@
-# Gets the LLVM that builds the game's code module into third_party\llvm, where CMake (LLVM_ROOT) and tools\package.ps1
-# look for it (ANALYSIS.md, Phase 5, The game's code module): clang.exe, lld-link.exe and clang's own headers from LLVM's
-# own Windows x64 build, pinned and checked against its SHA-256, and the licenses of LLVM, clang and lld from its tag.
-# Visual Studio's clang is the same version and builds the same module, but Visual Studio's license doesn't let it ship:
-# a release ships this one, and the development build compiles the module with it too, so what's tested is what ships.
+# Gets the LLVM that builds the game's code module into third_party\llvm, where CMake (LLVM_ROOT) looks for it
+# (ANALYSIS.md, Phase 5, The game's code module): clang.exe, lld-link.exe and clang's own headers from LLVM's own
+# Windows x64 build, pinned and checked against its SHA-256, and the licenses of LLVM, clang and lld from its tag.
+# Visual Studio's clang is the same version today and builds the same module; with this one, the module doesn't depend
+# on the Visual Studio a PC has.
 # The SHA-256 is GitHub's for the release's file, whose build attestation (gh attestation verify <file> --repo
 # llvm/llvm-project) names LLVM's release workflow at the tag. The archive is about 820 MB; what's kept, about 200 MB.
 # Usage: powershell -ExecutionPolicy Bypass -File tools\getllvm.ps1 [-Archive <the .tar.xz, already downloaded>]
 param([string]$Archive = '')
 $ErrorActionPreference = 'Stop'
 $version = '22.1.3'
-# lld-link.exe holds the libxml2 that LLVM's release build compiles in (llvm/utils/release/build_llvm_release.bat):
-# 2.9.12 for 22.1.3, whose notice is tools\licenses\libxml2.txt. Check it with another version.
 $name = "clang+llvm-$version-x86_64-pc-windows-msvc"
 $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-$version/$name.tar.xz"
 $sha256 = 'F2D7D200F72C83880AA2C1C00F6B6A67D0EA607EA663DAFBD0CB2DB6E2819ED0'

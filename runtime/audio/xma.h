@@ -6,6 +6,14 @@
 
 namespace audio
 {
+    // The decoder's registers (MMIO).
+    inline constexpr uint32_t kXmaRegisterPage = 0x7FEA0000;
+    inline constexpr uint32_t kXmaRegisterPageSize = 0x10000;
+
+    // Allocates the context array and publishes its address in the register page (which the caller reserves), before
+    // the game reads it (see xma.cpp).
+    void InitializeXmaRegisters();
+
     struct XmaTestDecode
     {
         bool ok = false;              // FFmpeg is there and decoded every packet

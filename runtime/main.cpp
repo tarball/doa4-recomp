@@ -1,7 +1,7 @@
 // Recompilation runtime entry point.
 //
 // Usage: <executable> [game data directory] [disc image]
-// The game runs from its disc image: an .iso of GAME_TITLE (GAME_VERSION) next to the executable (or in the data
+// The game runs from its disc image: an .iso of GAME_DISC (CMakeLists.txt) next to the executable (or in the data
 // directory or the working directory, or settings.ini's disc_image), whose default.xex is checked by its SHA-256 (the
 // version disc_image.cpp names) and unpacked in memory (see disc_image.h). A development checkout keeps default.xex
 // and default.pe (the decrypted, decompressed image produced by tools/xexunpack.ps1) in its data directory instead,
@@ -9,6 +9,8 @@
 // The data directory holds settings.ini, saves, caches and the hard disk's folders: by default "private" in the working
 // directory if it has default.xex (a development checkout), else "data" next to the executable (a release).
 // HEADLESS=1 runs without a window or renderer (the GPU command stream is still executed).
+#include "audio/audio_system.h"
+#include "audio/xma.h"
 #include "config.h"
 #include "crash_handler.h"
 #include "disc_image.h"
@@ -196,12 +198,12 @@ namespace
                     return {};
                 }
             }
-            return "No disc image of " GAME_TITLE " (" GAME_VERSION ") was found.";
+            return "No " GAME_DISC " disc image was found.";
         }
 
         const std::string folder = ExecutableDirectory();
-        const std::string where = "Put your disc image of " GAME_TITLE " (" GAME_VERSION "), an .iso file, in this folder:\n\n" +
-            (folder.empty() ? std::string("the game's folder") : folder) + "\n\nThe game runs from it and doesn't change it.";
+        const std::string where = "Put your " GAME_DISC " disc image (.iso) in this folder:\n\n" +
+            (folder.empty() ? std::string("the game's folder") : folder);
         std::string problems;
         for (const std::string& candidate : images)
         {
@@ -220,14 +222,12 @@ namespace
                 LOG_INFO("Game from %s", candidate.c_str());
                 return {};
             case disc::Check::kUnreadable:
-                problems += "\n- " + name + " isn't an Xbox 360 disc image.";
-                break;
             case disc::Check::kOtherGame:
-                problems += "\n- " + name + " is another game, or another version of it.";
+                problems += "\n- " + name + " doesn't appear to be a valid " GAME_DISC " disc image.";
                 break;
             }
         }
-        return problems.empty() ? where : "No disc image of " GAME_TITLE " (" GAME_VERSION ") was found:" + problems + "\n\n" + where;
+        return problems.empty() ? where : "No " GAME_DISC " disc image was found:" + problems + "\n\n" + where;
     }
 
     bool MountDevices(const std::string& dataDirectory, const std::string& discImage)
@@ -237,18 +237,34 @@ namespace
             return false;
         vfs::Mount("\\Device\\Cdrom0", std::move(disc));
 
-        // Hard disk partitions are host folders under <data>/hdd.
-        const std::pair<const char*, const char*> partitions[] = {
-            { "\\Device\\Harddisk0\\Partition1", "Partition1" },
-            { "\\Device\\Harddisk0\\Cache0", "Cache0" },
-            { "\\Device\\Harddisk0\\Cache1", "Cache1" },
-        };
-        for (const auto& [mountPoint, folder] : partitions)
+        // Hard disk partitions: their file systems are host folders under <data>/hdd, and their raw sectors (what XAPI
+        // reads and writes when it formats and mounts the cache) are <data>/hdd/<partition>.raw. The layout is a retail
+        // 20 GB drive's; Partition0 is the whole disk, with no file system of its own. A game whose utility drive is off
+        // (GAME_UTILITY_DRIVE in CMakeLists.txt) has no Partition0: XAPI can't read the cache's header there, so the
+        // utility drive (cache:) doesn't mount and the game reads its files from the disc.
+        constexpr uint64_t kDiskSize = 20ull << 30;
+        struct Partition
         {
-            auto device = vfs::OpenHostDevice(std::string("hard disk ") + folder, dataDirectory + "/hdd/" + folder);
+            const char* name;
+            vfs::PartitionLayout layout;
+            bool fileSystem;
+        };
+        const Partition partitions[] = {
+#if GAME_UTILITY_DRIVE
+            { "Partition0", { 0, kDiskSize }, false },
+#endif
+            { "Cache0", { 0x80000, 0x80000000 }, true },
+            { "Cache1", { 0x80080000, 0x80000000 }, true },
+            { "Partition1", { 0x130EB0000, kDiskSize - 0x130EB0000 }, true },
+        };
+        for (const Partition& partition : partitions)
+        {
+            const std::string folder = dataDirectory + "/hdd/" + partition.name;
+            auto device = vfs::OpenHardDiskPartition(std::string("hard disk ") + partition.name, partition.fileSystem ? folder : std::string(),
+                folder + ".raw", partition.layout);
             if (!device)
                 return false;
-            vfs::Mount(mountPoint, std::move(device));
+            vfs::Mount(std::string("\\Device\\Harddisk0\\") + partition.name, std::move(device));
         }
 
         // The title was "launched" from the disc.
@@ -312,12 +328,19 @@ int main(int argc, char** argv)
     if (!guest::Initialize())
         return Fail("Can't reserve the 4 GB of address space the game needs.");
 
-    // The image, the indirect call table after it and the GPU register window are never handed out.
+    // The image, the indirect call table after it and the GPU's and the XMA decoder's registers are never handed out.
     constexpr uint32_t kLookupTableSize = uint32_t(PPC_CODE_SIZE * 2);
     if (!guest::ReserveFixed(uint32_t(PPC_IMAGE_BASE), uint32_t(PPC_IMAGE_SIZE), guest::kPageReadWrite) ||
         !guest::ReserveFixed(uint32_t(PPC_IMAGE_BASE + PPC_IMAGE_SIZE), kLookupTableSize, guest::kPageReadOnly) ||
-        !guest::ReserveFixed(gpu::kRegisterWindow, gpu::kRegisterWindowSize, guest::kPageReadWrite))
+        !guest::ReserveFixed(gpu::kRegisterWindow, gpu::kRegisterWindowSize, guest::kPageReadWrite) ||
+        !guest::ReserveFixed(audio::kXmaRegisterPage, audio::kXmaRegisterPageSize, guest::kPageReadWrite))
         return Fail("Can't reserve the address space for the game's image.");
+    // A game whose XAudio drives the XMA decoder through its registers (DOAX2's, of a later XDK) reads the context
+    // array's address from them as it starts, so the decoder starts now. One that uses the XMA context exports instead
+    // (DOA4's imports XMAInitializeContext, the kernel's ordinal 549) starts it with its first context, as before, so its
+    // physical memory is laid out as before.
+    if (!imports::FunctionThunk("Kernel", 549))
+        audio::InitializeXmaRegisters();
 
     // 1 ms timer resolution, so guest sleeps and the time stamp bundle are accurate.
     timeBeginPeriod(1);
@@ -409,9 +432,9 @@ int main(int argc, char** argv)
                 profile::DumpHostStacks();
             }
             const uint64_t swaps = stats.swaps;
-            LOG_INFO("GPU: %llu frames (%.1f fps), %llu draws, %llu packets, %llu vblanks", (unsigned long long)swaps,
+            LOG_INFO("GPU: %llu frames (%.1f fps), %llu draws, %llu packets, %llu vblanks; audio: %llu frames", (unsigned long long)swaps,
                 (swaps - lastSwaps) / 5.0, (unsigned long long)stats.draws.load(), (unsigned long long)stats.packets.load(),
-                (unsigned long long)stats.vblanks.load());
+                (unsigned long long)stats.vblanks.load(), (unsigned long long)audio::SubmittedFrames());
             // A game that stopped making frames once it had (hung, or a netplay session waiting for the other machine; loading
             // screens are frames too): where its threads and the command processor are, once. And outside a session, whose
             // own status says when it waits for the other machine, the window's title says so after 10 s, until frames come.

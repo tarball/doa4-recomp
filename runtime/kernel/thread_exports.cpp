@@ -66,6 +66,13 @@ namespace
         return status::kSuccess;
     }
 
+    // Returns the previous suspend count.
+    uint32_t KeResumeThread(uint32_t kthread)
+    {
+        auto thread = ThreadFromKThread(kthread);
+        return thread ? thread->Resume() : 0;
+    }
+
     uint32_t NtSuspendThread(uint32_t handle, be<uint32_t>* previousCount)
     {
         auto thread = LookupHandleAs<GuestThread>(handle);
@@ -136,7 +143,7 @@ namespace
             if (thread)
             {
                 thread->waits++;
-                thread->waitObject.store(0, std::memory_order_relaxed);
+                thread->waitObjects[0].store(0, std::memory_order_relaxed);
                 thread->waitCount.store(uint32_t(std::min<int64_t>(-ticks / 10000, 0xFFFFFFFF)), std::memory_order_relaxed); // ms
                 thread->waitKind.store(GuestThread::WaitKind::kDelay, std::memory_order_release);
             }
@@ -196,6 +203,7 @@ namespace
 GUEST_EXPORT(ExCreateThread, ExCreateThread)
 GUEST_EXPORT(ExTerminateThread, ExTerminateThread)
 GUEST_EXPORT(NtResumeThread, NtResumeThread)
+GUEST_EXPORT(KeResumeThread, KeResumeThread)
 GUEST_EXPORT(NtSuspendThread, NtSuspendThread)
 GUEST_EXPORT(KeSetAffinityThread, KeSetAffinityThread)
 GUEST_EXPORT(KeSetBasePriorityThread, KeSetBasePriorityThread)

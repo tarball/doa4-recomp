@@ -461,10 +461,19 @@ void main(uint3 id : SV_DispatchThreadID)
         // 2D (1D as 2D) and cube textures, viewed as the shader declares them (no 3D or stacked yet).
         const uint32_t dimension = fetch.Dimension();
         const bool cube = dimension == 3;
+        if (fetch.Type() == 2 && dimension == 2)
+        {
+            static std::unordered_set<uint32_t> reported;
+            if (reported.insert(fetch.BaseAddress()).second)
+                LOG_WARN("GPU: %s texture %ux%ux%u, format %u, %s, pitch %u, endian %u, mips %u-%u at %08X, base %08X (bound as null)",
+                    fetch.Stacked() ? "stacked" : "3D", fetch.Width(), fetch.Height(), fetch.Depth(), uint32_t(fetch.Format()),
+                    fetch.Tiled() ? "tiled" : "linear", fetch.Pitch(), fetch.Endian(), fetch.MipMinLevel(), fetch.MipMaxLevel(), fetch.MipAddress(),
+                    fetch.BaseAddress());
+        }
         if (fetch.Type() != 2 || dimension == 2 || shaderDimension == 2 || cube != (shaderDimension == 3))
         {
             static bool reported[4][4];
-            if (fetch.Type() == 2 && (cube || shaderDimension == 3) && !reported[dimension][shaderDimension & 3])
+            if (fetch.Type() == 2 && (cube || shaderDimension == 3 || shaderDimension == 2) && dimension != 2 && !reported[dimension][shaderDimension & 3])
             {
                 reported[dimension][shaderDimension & 3] = true;
                 LOG_WARN("GPU: texture at %08X has dimension %u but is sampled as dimension %u (bound as null)", fetch.BaseAddress(), dimension,

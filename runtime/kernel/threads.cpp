@@ -181,17 +181,27 @@ namespace kernel
         std::string DescribeWait(const GuestThread& thread)
         {
             const GuestThread::WaitKind kind = thread.waitKind.load(std::memory_order_acquire);
-            const uint32_t object = thread.waitObject.load(std::memory_order_relaxed), count = thread.waitCount.load(std::memory_order_relaxed);
+            const uint32_t object = thread.waitObjects[0].load(std::memory_order_relaxed), count = thread.waitCount.load(std::memory_order_relaxed);
             char text[160];
             switch (kind)
             {
             case GuestThread::WaitKind::kAny:
             case GuestThread::WaitKind::kAll:
                 if (count > 1)
-                    snprintf(text, sizeof(text), "waits for %s %u objects, the first %s", kind == GuestThread::WaitKind::kAll ? "all of" : "one of",
-                        count, DescribeObject(object).c_str());
-                else
-                    snprintf(text, sizeof(text), "waits for %s", DescribeObject(object).c_str());
+                {
+                    // Each object (the first kWaitObjects): in a wait for all, those set are the ones it doesn't wait for.
+                    snprintf(text, sizeof(text), "waits for %s %u objects: ", kind == GuestThread::WaitKind::kAll ? "all of" : "one of", count);
+                    std::string description = text;
+                    for (uint32_t i = 0; i < std::min<uint32_t>(count, GuestThread::kWaitObjects); i++)
+                        description += (i ? ", " : "") + DescribeObject(thread.waitObjects[i].load(std::memory_order_relaxed));
+                    if (count > GuestThread::kWaitObjects)
+                    {
+                        snprintf(text, sizeof(text), " and %u more", count - uint32_t(GuestThread::kWaitObjects));
+                        description += text;
+                    }
+                    return description;
+                }
+                snprintf(text, sizeof(text), "waits for %s", DescribeObject(object).c_str());
                 return text;
             case GuestThread::WaitKind::kCriticalSection:
             {

@@ -1,41 +1,49 @@
 # Dead or Alive 4 for Windows
 
-A recompilation of the Xbox 360 game Dead or Alive 4 into a Windows program. The game's PowerPC code is translated to
-C++ by [XenonRecomp](https://github.com/tarball/XenonRecomp) (a fork of it, branch `doa4`), and runs on a runtime of its
-own: the console's kernel and system calls, a Direct3D 12 renderer for its graphics, its XMA audio and movies, and
-netplay for Versus.
+An unofficial Windows port of the Xbox 360 version of Dead or Alive 4, made by static recompilation with a
+[fork](https://github.com/tarball/XenonRecomp) of [XenonRecomp](https://github.com/hedge-dev/XenonRecomp).
 
-**None of the game's files are here or in the releases, not even its recompiled code.** You need your own disc image of
-Dead or Alive 4 (Rev 1) (USA, Europe), an `.iso` file. The first time a release starts, its launcher builds the game's
-code from your disc image, on your PC; the game then runs from the disc image, which is only read, never changed.
+**This repository doesn't include any of the game's resources. You need your own Dead or Alive 4 (Rev 1) (USA, Europe)
+disc image to play.**
+
+## Requirements
+
+- 64-bit Windows 10 or 11
+- A processor with AVX (most from 2011 on)
+- A graphics card with Direct3D 12
+- Your Dead or Alive 4 (Rev 1) (USA, Europe) disc image (.iso)
+
+## How to install
+
+1. Download the latest release's zip from [Releases](https://github.com/tarball/doa4-recomp-releases/releases).
+2. Extract it to a folder of its own that you can write to, such as one in Documents (not Program Files).
+3. Run `DOA4 Launcher.exe`. If Windows says it doesn't recognize the app, choose More info, then Run anyway.
+4. Select your Dead or Alive 4 (Rev 1) (USA, Europe) disc image, choose Play or Netplay, then press Launch.
+
+To update, extract a new release over the old one. Your saves and settings are kept.
 
 ## Playing
 
-Download the zip of the latest release from [the releases](https://github.com/tarball/doa4-recomp-releases/releases),
-extract it to a folder of its own that you can change (such as one in Documents), and start `DOA4 Launcher.exe`.
-[INSTALL.md](INSTALL.md) has what it needs (64-bit Windows 10 or 11, a processor with AVX, a graphics card with
-Direct3D 12), the controls and settings, netplay and updating.
+- **Controls:** an Xbox controller or any XInput controller (PlayStation controllers need a tool such as DS4Windows).
+  Keyboard: arrows or WASD move, Enter is Start, Backspace is Back, Z/J/Space is A, X/K is B, C/U is X, V/I is Y, Q
+  and E are the shoulder buttons, 1 and 3 the triggers.
+- **Graphics options:** SETTINGS > VIDEO has Fullscreen, Resolution (up to 4 times 1280x720), Anti-Aliasing, Alpha to
+  Coverage and Texture Filtering. Alt+Enter toggles fullscreen.
+- **First run:** the game compiles its shaders in the background, so some scenes can appear a moment late.
+- Saves, settings and the log (`doa4.log`) are in the `data` folder.
 
-Netplay plays Versus with another PC, over the internet or a local network. Only play with people you trust, on a
-network you trust: netplay hasn't had a security review yet.
+## Netplay
 
-## Building from source
+Netplay plays Versus with another PC, over the internet or a local network. One player hosts on a UDP port (to play
+over the internet, forward that port to the host's PC on its router); the other joins with the host's address and
+port. Both choose the same for fights: Rollback, the default, which plays better over the internet, or Lockstep. Only
+play with people you trust, on a network you trust: netplay hasn't had a security review yet.
 
-[INSTALL.md's Building from source](INSTALL.md#building-from-source): with Visual Studio's C++ and Clang tools, Python
-and Git, `setup.ps1` checks your disc image, recompiles the game's code and builds the game.
+## Building
 
-## This repository
+See [BUILD.md](BUILD.md).
 
-Each commit is a release, tagged by its date and its own short hash (`v2026.10.27-e3a1ced`), and the release of the
-same name has its zip. Its notes name the XenonRecomp commit it was built with.
+## License
 
-## Licenses
-
-This project is free software under the GNU General Public License, version 3: see [LICENSE](LICENSE).
-
-A release's `licenses` folder has that license and those of what it ships and what's compiled into it: LLVM's clang
-and lld-link (with libxml2's notice), XenonRecomp (with GNU binutils' PowerPC disassembler, GPL-2.0 or later,
-libmspack, LGPL-2.1, and code from Xenia), FFmpeg (LGPL), simde, xxHash, fmt, toml++, tiny-AES-c and TinySHA1, and
-Xenia's (BSD-3-Clause), whose work parts of the runtime follow.
-
-This project isn't affiliated with or endorsed by Koei Tecmo, Team NINJA or Microsoft.
+GNU General Public License, version 3: see [LICENSE](LICENSE). Releases include the licenses of the libraries they
+ship. This project isn't affiliated with or endorsed by Koei Tecmo, Team NINJA or Microsoft.

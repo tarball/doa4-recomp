@@ -3,10 +3,12 @@
 
 #include "guest_abi.h"
 #include "imports.h"
+#include "kernel/status.h"
 #include "log.h"
 
 #include <cstring>
 #include <fstream>
+#include <mutex>
 #include <vector>
 
 namespace
@@ -186,7 +188,78 @@ namespace
         const uint32_t flags = kernel::GetXexOptionalHeader(g_xexHeader, kXexHeaderSystemFlags);
         return (flags >> privilege) & 1;
     }
+
+    // The system modules a title can ask for by name, to look up their exports by ordinal. Each has a loader entry with
+    // only its names filled in as its handle. Their procedures are the title's own import thunks, so only what the title
+    // imports is found: DOAX2's XNet asks XAM for NetDll_XNetStartupEx and NetDll_WSAStartupEx, which it doesn't
+    // import, and then uses NetDll_XNetStartup and NetDll_WSAStartup, which it does.
+    struct SystemModule
+    {
+        const char* fileName;
+        const char* library; // as imports.inc names it
+        uint32_t entry = 0;
+    };
+    SystemModule g_systemModules[] = { { "xam.xex", "Xam" }, { "xboxkrnl.exe", "Kernel" } };
+
+    constexpr uint32_t kStatusDllNotFound = 0xC0000135;
+    constexpr uint32_t kStatusProcedureNotFound = 0xC000007A;
+
+    uint32_t XexGetModuleHandle(const char* name, be<uint32_t>* handle)
+    {
+        if (!handle)
+            return status::kInvalidParameter;
+        *handle = 0;
+        if (!name || _stricmp(name, "default.xex") == 0)
+        {
+            *handle = guest::LoadU32(imports::VariableAddress("XexExecutableModuleHandle"));
+            return status::kSuccess;
+        }
+        for (SystemModule& module : g_systemModules)
+        {
+            if (_stricmp(name, module.fileName) != 0)
+                continue;
+            static std::mutex lock;
+            std::lock_guard guard(lock);
+            if (!module.entry)
+            {
+                module.entry = guest::KernelAlloc(0x100);
+                auto* entry = guest::Translate<LoaderEntry>(module.entry);
+                const uint16_t nameBytes = uint16_t(strlen(module.fileName) * 2);
+                const uint32_t nameAddress = StoreWideString(module.entry + sizeof(LoaderEntry), module.fileName);
+                entry->fullDllName = { nameBytes, uint16_t(nameBytes + 2), nameAddress };
+                entry->baseDllName = { nameBytes, uint16_t(nameBytes + 2), nameAddress };
+                entry->loadCount = 1;
+            }
+            *handle = module.entry;
+            return status::kSuccess;
+        }
+        LOG_WARN("XexGetModuleHandle(\"%s\"): no such module", name);
+        return kStatusDllNotFound;
+    }
+
+    uint32_t XexGetProcedureAddress(uint32_t handle, uint32_t ordinal, be<uint32_t>* address)
+    {
+        if (!address)
+            return status::kInvalidParameter;
+        *address = 0;
+        for (const SystemModule& module : g_systemModules)
+        {
+            if (!handle || handle != module.entry)
+                continue;
+            const uint32_t thunk = imports::FunctionThunk(module.library, ordinal);
+            if (!thunk)
+            {
+                LOG_TRACE("XexGetProcedureAddress(%s, %u): the title doesn't import it", module.fileName, ordinal);
+                return kStatusProcedureNotFound;
+            }
+            *address = thunk;
+            return status::kSuccess;
+        }
+        return kStatusProcedureNotFound; // the executable exports nothing
+    }
 }
 
 GUEST_EXPORT(RtlImageXexHeaderField, RtlImageXexHeaderField)
 GUEST_EXPORT(XexCheckExecutablePrivilege, XexCheckExecutablePrivilege)
+GUEST_EXPORT(XexGetModuleHandle, XexGetModuleHandle)
+GUEST_EXPORT(XexGetProcedureAddress, XexGetProcedureAddress)

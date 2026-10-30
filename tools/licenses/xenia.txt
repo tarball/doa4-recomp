@@ -1,9 +1,7 @@
-Xenia's license (https://github.com/xenia-project/xenia, its LICENSE), BSD-3-Clause. It covers:
-- toolchain\XenonRecomp.exe's XEX patcher and kernel and XAM export tables (XenonRecomp's XenonUtils), which are
-  Xenia's and Xenia Canary's code under this license;
-- the parts of this project's runtime (doa4.exe) that follow Xenia's: the layouts of the guest's structures (XMA
-  contexts, X_DISPLAY_INFO), the GPU's register names and data formats, values the kernel and XAM report, and two of
-  its GPU computations (a packed mip tail's offsets, polygon offset).
+Xenia's license (https://github.com/xenia-project/xenia, its LICENSE), BSD-3-Clause. It covers the parts of this
+project's runtime (doa4.exe) that follow Xenia's: the layouts of the guest's structures (XMA contexts,
+X_DISPLAY_INFO), the GPU's register names and data formats, values the kernel and XAM report, and two of its GPU
+computations (a packed mip tail's offsets, polygon offset).
 
 Copyright (c) 2015, Ben Vanik.
 All rights reserved.

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <windows.h>
@@ -144,5 +145,18 @@ namespace crash
     {
         const auto it = std::upper_bound(g_guestStarts.begin(), g_guestStarts.end(), guestAddress);
         return it == g_guestStarts.begin() ? 0 : *std::prev(it);
+    }
+
+    void Fatal(const std::string& message)
+    {
+        fprintf(stderr, "\n*** Fatal: %s\n", message.c_str());
+        if (const kernel::GuestThread* thread = kernel::CurrentThread(); thread && thread->Context())
+            guest::PrintBacktrace(thread->Context()->r1.u32);
+        fflush(stderr);
+        const char* headless = std::getenv(GAME_PREFIX "_HEADLESS");
+        if (!headless || std::atoi(headless) == 0)
+            MessageBoxA(nullptr, message.c_str(), GAME_TITLE, MB_ICONERROR | MB_OK | MB_TOPMOST | MB_SETFOREGROUND);
+        // Without running static destructors under the game's other threads.
+        std::_Exit(1);
     }
 }

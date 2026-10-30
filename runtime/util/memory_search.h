@@ -10,4 +10,8 @@ namespace debug
 {
     // Called once per presented frame.
     void FloatSearchOnFrame(uint64_t frame);
+
+    // DEBUG_WATCH_CHANGES=address[,address...] (debugging; hex guest addresses): logs each of those 32-bit words
+    // whenever it changed since the last presented frame, with the frame. Called once per presented frame.
+    void WatchChangesOnFrame(uint64_t frame);
 }

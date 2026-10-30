@@ -303,8 +303,10 @@ namespace gpu::audit
         if ((destInfo >> 3) & 0xF)
             Finding(Format("resolve into an array or a 3D slice (RB_COPY_DEST_INFO %08X)", destInfo));
         const bool floatDest = destFormat == 31 || destFormat == 32 || destFormat == 36 || destFormat == 37;
-        if (destFormat != 4 && destFormat != 6 && destFormat != 7 && destFormat != 25 && destFormat != 26 && !floatDest && destFormat != 62 &&
-            sourceSelect < 4)
+        // (The formats color resolves write: k_8 and k_5_6_5 below a dword, 8_8_8_8 and its gamma version, 2_10_10_10,
+        // 16_16, 16_16_16_16 and the float ones.)
+        if (destFormat != 2 && destFormat != 4 && destFormat != 6 && destFormat != 7 && destFormat != 25 && destFormat != 26 && !floatDest &&
+            destFormat != 62 && sourceSelect < 4)
             Finding(Format("resolve to format %u (not written)", destFormat));
         if (number != 0 && !(floatDest && number == 7))
             Finding(Format("resolve number format %u to format %u (RB_COPY_DEST_INFO %08X)", number, destFormat, destInfo));

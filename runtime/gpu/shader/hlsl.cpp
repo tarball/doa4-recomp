@@ -1,10 +1,12 @@
 #include "gpu/shader/hlsl.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 namespace gpu::shader
 {
@@ -105,12 +107,12 @@ float XeLogClamp(float a)
 static bool xe_debug_product = false;
 static uint xe_debug_instruction = 0u, xe_debug_first = 0xFFFFu, xe_debug_last = 0u;
 
+// (XeMul and XeDot have no local variables: in some of DOAX2's state machine pixel shaders, FXC failed on any, at any
+// optimization level, with "internal error: invalid access of unbound variable".)
 float4 XeMul(float4 a, float4 b)
 {
-    float4 p = a * b;
-    bool4 zero = min(abs(a), abs(b)) == 0.0;
 #ifdef XE_DEBUG_NAN
-    if (any(zero && (asuint(p) & 0x7F800000u) == 0x7F800000u))
+    if (any(min(abs(a), abs(b)) == 0.0 && (asuint(a * b) & 0x7F800000u) == 0x7F800000u))
     {
         xe_debug_product = true;
         xe_debug_first = min(xe_debug_first, xe_debug_instruction);
@@ -118,9 +120,10 @@ float4 XeMul(float4 a, float4 b)
     }
 #endif
 #ifdef XE_XENOS_PRODUCTS
-    p = zero ? 0.0 : p;
+    return min(abs(a), abs(b)) == 0.0 ? 0.0 : a * b;
+#else
+    return a * b;
 #endif
-    return p;
 }
 
 float XeMul(float a, float b)
@@ -128,10 +131,14 @@ float XeMul(float a, float b)
     return XeMul(float4(a, 0.0, 0.0, 0.0), float4(b, 0.0, 0.0, 0.0)).x;
 }
 
+float XeSum(float4 v)
+{
+    return v.x + v.y + v.z + v.w;
+}
+
 float XeDot(float4 a, float4 b)
 {
-    float4 p = XeMul(a, b);
-    return p.x + p.y + p.z + p.w;
+    return XeSum(XeMul(a, b));
 }
 
 #ifdef XE_DEBUG_NAN
@@ -142,15 +149,27 @@ bool4 XeNonFinite(float4 v)
     return (asuint(v) & 0x7F800000u) == 0x7F800000u;
 }
 
-// Counts an invocation of the shader (by its hash) in its slot (kDebugCountSlots in hlsl.h): stage is 1 for pixel
-// shaders, outputs and inputs the kDebugNonFinite bits of what was non-finite.
-void XeDebugCount(uint2 hash, uint stage, bool product, uint outputs, uint inputs)
+// The non-finite components of an interpolator, as 4 bits (x lowest).
+uint XeNonFiniteNibble(float4 v)
+{
+    return (XeNonFinite(v).x ? 1u : 0u) | (XeNonFinite(v).y ? 2u : 0u) | (XeNonFinite(v).z ? 4u : 0u) | (XeNonFinite(v).w ? 8u : 0u);
+}
+
+// Counts an invocation of the shader (by its hash) in its slot (kDebugCountSlots and kDebugSlotDwords in hlsl.h):
+// stage is 1 for pixel shaders, outputs and inputs the kDebugNonFinite bits of what was non-finite, components the
+// interpolator components that were (XeNonFiniteNibble's, 8 interpolators a dword).
+void XeDebugCount(uint2 hash, uint stage, bool product, uint outputs, uint inputs, uint2 components)
 {
     if (product || outputs != 0u || inputs != 0u)
     {
-        uint slot = (hash.x & 4095u) * 32u;
+        uint slot = (hash.x & 4095u) * 64u;
         xe_debug_counts.Store2(slot, hash);
         xe_debug_counts.InterlockedOr(slot + 8u, stage | outputs | inputs);
+        if (any(components != 0u))
+        {
+            xe_debug_counts.InterlockedOr(slot + 32u, components.x);
+            xe_debug_counts.InterlockedOr(slot + 36u, components.y);
+        }
         if (product)
         {
             xe_debug_counts.InterlockedAdd(slot + 12u, 1u);
@@ -269,12 +288,44 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             return text;
         }
 
+        // DEBUG_SHOW=<hash prefix>:tf<N>, :r<N> or :i<N> (diagnostics): the pixel shaders whose hash starts with those hex
+        // digits output, as their color 0, the result of their last texture fetch from fetch constant N, temp register N at
+        // their end, or interpolator N as they receive it (alpha 1).
+        struct DebugShow
+        {
+            std::string hash;
+            char mode = 0; // 't', 'r' or 'i'
+            uint32_t index = 0;
+        };
+
+        const DebugShow& DebugShowSetting()
+        {
+            static const DebugShow setting = [] {
+                DebugShow show;
+                const char* value = std::getenv(GAME_PREFIX "_DEBUG_SHOW");
+                const char* colon = value ? strchr(value, ':') : nullptr;
+                if (!colon || (colon[1] != 't' && colon[1] != 'r' && colon[1] != 'i'))
+                    return show;
+                show.hash.assign(value, colon);
+                for (char& c : show.hash)
+                    c = char(toupper(uint8_t(c)));
+                show.mode = colon[1];
+                show.index = uint32_t(atoi(colon + (show.mode == 't' ? 3 : 2)));
+                return show;
+            }();
+            return setting;
+        }
+
         class Translator
         {
         public:
             Translator(const ParsedShader& shader, const TranslationOptions& options)
                 : m_shader(shader), m_options(options), m_vertex(shader.stage == ShaderStage::kVertex)
             {
+                const DebugShow& show = DebugShowSetting();
+                char hash[17];
+                snprintf(hash, sizeof(hash), "%016llX", (unsigned long long)shader.hash);
+                m_debugShow = !m_vertex && !show.hash.empty() && strncmp(hash, show.hash.c_str(), show.hash.size()) == 0;
             }
 
             HlslResult Translate();
@@ -355,12 +406,15 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             void EmitVertexFetch(const FetchInstruction& fetch);
             void EmitTextureFetch(const FetchInstruction& fetch);
             void EmitExecBody(const CfInstruction& cf);
+            void EmitCf(uint32_t index);
             void EmitStructured();
+            void EmitForward();
             void EmitStateMachine();
 
             const ParsedShader& m_shader;
             const TranslationOptions m_options;
             const bool m_vertex;
+            bool m_debugShow = false; // DEBUG_SHOW names this shader
             std::string m_body;
             int m_indent = 1;
             FetchInstruction m_fullVertexFetch{};
@@ -796,9 +850,15 @@ float4 XeMinMaxFactors(float4 color, uint factors)
 
             const uint32_t constant = full.VertexConstantIndex();
             Line(Format("uint2 xe_vf = xe_fetch_constants[%u].%s;", constant / 2, (constant & 1) ? "zw" : "xy"));
-            const std::string index = Temp(full.SrcReg(), full.SrcRelative()) + '.' + kComponentNames[full.VertexSrcComponent()];
-            Line(Format("int xe_index = int(%s);", full.VertexIndexRounded() ? ("floor(" + index + " + 0.5)").c_str() : ("floor(" + index + ")").c_str()));
-            Line(Format("uint xe_address = (xe_vf.x & 0xFFFFFFFCu) + uint(xe_index * %u + %d) * 4u;", full.VertexStride(), fetch.VertexOffset()));
+            // The index is read once, by the full fetch: its mini fetches use it even when a fetch between them wrote the
+            // index register (DOAX2's ground shaders fetch their last texture coordinates into it, so the lightmap's came
+            // from the wrong vertex and the beaches came out white).
+            if (!fetch.VertexMiniFetch())
+            {
+                const std::string index = Temp(full.SrcReg(), full.SrcRelative()) + '.' + kComponentNames[full.VertexSrcComponent()];
+                Line(Format("xe_vfetch_index = int(%s);", full.VertexIndexRounded() ? ("floor(" + index + " + 0.5)").c_str() : ("floor(" + index + ")").c_str()));
+            }
+            Line(Format("uint xe_address = (xe_vf.x & 0xFFFFFFFCu) + uint(xe_vfetch_index * %u + %d) * 4u;", full.VertexStride(), fetch.VertexOffset()));
             static const char* kLoads[] = { "", "uint4(xe_shared_memory.Load(xe_address), 0u, 0u, 0u)",
                 "uint4(xe_shared_memory.Load2(xe_address), 0u, 0u)", "uint4(xe_shared_memory.Load3(xe_address), 0u)",
                 "xe_shared_memory.Load4(xe_address)" };
@@ -956,6 +1016,8 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             }
             Line("float4 xe_texel = " + result + ";");
             CheckFetched("xe_texel", fetch.DstSwizzle(), kDebugNonFiniteTexels);
+            if (m_debugShow && DebugShowSetting().mode == 't' && fetch.TextureConstantIndex() == DebugShowSetting().index)
+                Line("xe_debug_show = xe_texel;");
 
             const std::string destination = Temp(fetch.DstReg(), fetch.DstRelative());
             for (uint32_t i = 0; i < 4; i++)
@@ -1022,6 +1084,115 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             Line("while (false);");
         }
 
+        // One CF instruction: what it does, then where the program counter goes (the next instruction, a target, or 0xFFFF
+        // at the end).
+        void Translator::EmitCf(uint32_t index)
+        {
+            const uint32_t count = uint32_t(m_shader.cf.size());
+            const CfInstruction& cf = m_shader.cf[index];
+            const std::string next = Format("%u", index + 1 < count ? index + 1 : 0xFFFFu);
+            switch (cf.Opcode())
+            {
+            case CfOpcode::kExec:
+            case CfOpcode::kExecEnd:
+                EmitExecBody(cf);
+                Line("xe_pc = " + (cf.IsEnd() ? std::string("0xFFFF") : next) + ";");
+                break;
+            case CfOpcode::kCondExec:
+            case CfOpcode::kCondExecEnd:
+            case CfOpcode::kCondExecPred:
+            case CfOpcode::kCondExecPredEnd:
+            case CfOpcode::kCondExecPredClean:
+            case CfOpcode::kCondExecPredCleanEnd:
+                Line("xe_pc = " + next + ";");
+                Open("if (" + ConditionText(cf) + ")");
+                EmitExecBody(cf);
+                if (cf.IsEnd())
+                    Line("xe_pc = 0xFFFF;");
+                Close();
+                break;
+            case CfOpcode::kLoopStart:
+            {
+                Line("xe_loop_stack_count[xe_loop_depth & 3u] = xe_loop_count;");
+                Line("xe_loop_stack_aL[xe_loop_depth & 3u] = xe_aL;");
+                Line("xe_loop_depth++;");
+                Line(Format("uint xe_loop_constant = XeLoopConstant(%uu);", cf.LoopId()));
+                Line("xe_loop_count = xe_loop_constant & 0xFFu;");
+                if (!cf.IsRepeat())
+                    Line("xe_aL = int((xe_loop_constant >> 8u) & 0xFFu);");
+                Open("if (xe_loop_count == 0u)");
+                Line("xe_loop_depth--;");
+                Line("xe_loop_count = xe_loop_stack_count[xe_loop_depth & 3u];");
+                Line("xe_aL = xe_loop_stack_aL[xe_loop_depth & 3u];");
+                Line(Format("xe_pc = %u;", cf.TargetAddress()));
+                Close();
+                Open("else");
+                Line("xe_pc = " + next + ";");
+                Close();
+                break;
+            }
+            case CfOpcode::kLoopEnd:
+            {
+                Line(Format("uint xe_loop_constant = XeLoopConstant(%uu);", cf.LoopId()));
+                Line("xe_loop_count--;");
+                Line("xe_aL += int(xe_loop_constant << 8u) >> 24;");
+                const std::string breakCondition =
+                    cf.IsPredicatedBreak() ? Format(" && xe_p0 != %s", cf.Condition() ? "true" : "false") : std::string();
+                Open("if (xe_loop_count != 0u" + breakCondition + ")");
+                Line(Format("xe_pc = %u;", cf.TargetAddress()));
+                Close();
+                Open("else");
+                Line("xe_loop_depth--;");
+                Line("xe_loop_count = xe_loop_stack_count[xe_loop_depth & 3u];");
+                Line("xe_aL = xe_loop_stack_aL[xe_loop_depth & 3u];");
+                Line("xe_pc = " + next + ";");
+                Close();
+                break;
+            }
+            case CfOpcode::kCondCall:
+                Open("if (" + ConditionText(cf) + ")");
+                Line("xe_call_stack[xe_call_depth & 3u] = " + next + ";");
+                Line("xe_call_depth++;");
+                Line(Format("xe_pc = %u;", cf.TargetAddress()));
+                Close();
+                Open("else");
+                Line("xe_pc = " + next + ";");
+                Close();
+                break;
+            case CfOpcode::kReturn:
+                Open("if (xe_call_depth != 0u)");
+                Line("xe_call_depth--;");
+                Line("xe_pc = xe_call_stack[xe_call_depth & 3u];");
+                Close();
+                Open("else");
+                Line("xe_pc = 0xFFFF;");
+                Close();
+                break;
+            case CfOpcode::kCondJmp:
+                Line(Format("xe_pc = (%s) ? %u : %s;", ConditionText(cf).c_str(), cf.TargetAddress(), next.c_str()));
+                break;
+            default:
+                Line("xe_pc = " + next + ";");
+                break;
+            }
+        }
+
+        // Shaders whose jumps never close a cycle, without loops or calls (if/else trees, as over bool constants): the CF
+        // instructions in an order where each comes after all that can lead to it (ParsedShader::forwardOrder: their own
+        // order when the jumps all go forward, as in DOAX2's), each run if the program counter is on it, so that a jump
+        // skips those before its target. FXC compiles the state machine of DOAX2's large vertex shaders of this kind
+        // (100-150 KB of HLSL) in minutes, this in seconds.
+        void Translator::EmitForward()
+        {
+            Line("int xe_pc = 0;");
+            for (uint32_t index : m_shader.forwardOrder)
+            {
+                Open(Format("if (xe_pc == %u)", index));
+                EmitCf(index);
+                Close();
+            }
+        }
+
         // General control flow: a loop over a switch on the CF instruction index.
         void Translator::EmitStateMachine()
         {
@@ -1038,96 +1209,10 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             // "internal error: l-value expected" on some shaders.
             Line("[forcecase]");
             Open("switch (xe_pc)");
-            const uint32_t count = uint32_t(m_shader.cf.size());
-            for (uint32_t index = 0; index < count; index++)
+            for (uint32_t index = 0; index < uint32_t(m_shader.cf.size()); index++)
             {
-                const CfInstruction& cf = m_shader.cf[index];
-                const std::string next = Format("%u", index + 1 < count ? index + 1 : 0xFFFFu);
                 Open(Format("case %u:", index));
-                switch (cf.Opcode())
-                {
-                case CfOpcode::kExec:
-                case CfOpcode::kExecEnd:
-                    EmitExecBody(cf);
-                    Line("xe_pc = " + (cf.IsEnd() ? std::string("0xFFFF") : next) + ";");
-                    break;
-                case CfOpcode::kCondExec:
-                case CfOpcode::kCondExecEnd:
-                case CfOpcode::kCondExecPred:
-                case CfOpcode::kCondExecPredEnd:
-                case CfOpcode::kCondExecPredClean:
-                case CfOpcode::kCondExecPredCleanEnd:
-                    Line("xe_pc = " + next + ";");
-                    Open("if (" + ConditionText(cf) + ")");
-                    EmitExecBody(cf);
-                    if (cf.IsEnd())
-                        Line("xe_pc = 0xFFFF;");
-                    Close();
-                    break;
-                case CfOpcode::kLoopStart:
-                {
-                    Line("xe_loop_stack_count[xe_loop_depth & 3u] = xe_loop_count;");
-                    Line("xe_loop_stack_aL[xe_loop_depth & 3u] = xe_aL;");
-                    Line("xe_loop_depth++;");
-                    Line(Format("uint xe_loop_constant = XeLoopConstant(%uu);", cf.LoopId()));
-                    Line("xe_loop_count = xe_loop_constant & 0xFFu;");
-                    if (!cf.IsRepeat())
-                        Line("xe_aL = int((xe_loop_constant >> 8u) & 0xFFu);");
-                    Open("if (xe_loop_count == 0u)");
-                    Line("xe_loop_depth--;");
-                    Line("xe_loop_count = xe_loop_stack_count[xe_loop_depth & 3u];");
-                    Line("xe_aL = xe_loop_stack_aL[xe_loop_depth & 3u];");
-                    Line(Format("xe_pc = %u;", cf.TargetAddress()));
-                    Close();
-                    Open("else");
-                    Line("xe_pc = " + next + ";");
-                    Close();
-                    break;
-                }
-                case CfOpcode::kLoopEnd:
-                {
-                    Line(Format("uint xe_loop_constant = XeLoopConstant(%uu);", cf.LoopId()));
-                    Line("xe_loop_count--;");
-                    Line("xe_aL += int(xe_loop_constant << 8u) >> 24;");
-                    const std::string breakCondition =
-                        cf.IsPredicatedBreak() ? Format(" && xe_p0 != %s", cf.Condition() ? "true" : "false") : std::string();
-                    Open("if (xe_loop_count != 0u" + breakCondition + ")");
-                    Line(Format("xe_pc = %u;", cf.TargetAddress()));
-                    Close();
-                    Open("else");
-                    Line("xe_loop_depth--;");
-                    Line("xe_loop_count = xe_loop_stack_count[xe_loop_depth & 3u];");
-                    Line("xe_aL = xe_loop_stack_aL[xe_loop_depth & 3u];");
-                    Line("xe_pc = " + next + ";");
-                    Close();
-                    break;
-                }
-                case CfOpcode::kCondCall:
-                    Open("if (" + ConditionText(cf) + ")");
-                    Line("xe_call_stack[xe_call_depth & 3u] = " + next + ";");
-                    Line("xe_call_depth++;");
-                    Line(Format("xe_pc = %u;", cf.TargetAddress()));
-                    Close();
-                    Open("else");
-                    Line("xe_pc = " + next + ";");
-                    Close();
-                    break;
-                case CfOpcode::kReturn:
-                    Open("if (xe_call_depth != 0u)");
-                    Line("xe_call_depth--;");
-                    Line("xe_pc = xe_call_stack[xe_call_depth & 3u];");
-                    Close();
-                    Open("else");
-                    Line("xe_pc = 0xFFFF;");
-                    Close();
-                    break;
-                case CfOpcode::kCondJmp:
-                    Line(Format("xe_pc = (%s) ? %u : %s;", ConditionText(cf).c_str(), cf.TargetAddress(), next.c_str()));
-                    break;
-                default:
-                    Line("xe_pc = " + next + ";");
-                    break;
-                }
+                EmitCf(index);
                 Line("break;");
                 Close();
             }
@@ -1143,6 +1228,8 @@ float4 XeMinMaxFactors(float4 color, uint factors)
         {
             if (m_shader.structuredControlFlow)
                 EmitStructured();
+            else if (m_shader.forwardControlFlow)
+                EmitForward();
             else
                 EmitStateMachine();
 
@@ -1168,7 +1255,7 @@ float4 XeMinMaxFactors(float4 color, uint factors)
             std::string prologue;
             prologue += Format("    float4 r[%u];\n", temps);
             prologue += Format("    [unroll] for (uint xe_i = 0u; xe_i < %uu; xe_i++)\n        r[xe_i] = float4(0.0, 0.0, 0.0, 0.0);\n", temps);
-            prologue += "    bool xe_p0 = false;\n    int xe_a0 = 0;\n    int xe_aL = 0;\n    float xe_ps = 0.0;\n";
+            prologue += "    bool xe_p0 = false;\n    int xe_a0 = 0;\n    int xe_aL = 0;\n    float xe_ps = 0.0;\n    int xe_vfetch_index = 0;\n";
             prologue += "    float xe_texture_lod = 0.0;\n    float3 xe_gradient_h = float3(0.0, 0.0, 0.0), xe_gradient_v = float3(0.0, 0.0, 0.0);\n";
             prologue += "    float4 xe_unused_export = float4(0.0, 0.0, 0.0, 0.0);\n";
             if (m_options.debugNan)
@@ -1194,10 +1281,12 @@ float4 XeMinMaxFactors(float4 color, uint factors)
                 if (m_options.debugNan)
                 {
                     source += Format("    uint xe_debug_outputs = any(XeNonFinite(xe_position)) ? %uu : 0u;\n", kDebugNonFinitePosition);
-                    source += Format("    [unroll] for (uint xe_n = 0u; xe_n < 16u; xe_n++)\n    {\n        if (any(XeNonFinite(xe_interpolators[xe_n])))\n"
-                                     "            xe_debug_outputs |= %uu;\n    }\n",
+                    source += Format("    uint2 xe_debug_components = uint2(0u, 0u);\n"
+                                     "    [unroll] for (uint xe_n = 0u; xe_n < 16u; xe_n++)\n"
+                                     "        xe_debug_components[xe_n >> 3u] |= XeNonFiniteNibble(xe_interpolators[xe_n]) << ((xe_n & 7u) * 4u);\n"
+                                     "    if (any(xe_debug_components != 0u))\n        xe_debug_outputs |= %uu;\n",
                         kDebugNonFiniteExports);
-                    source += "    XeDebugCount(" + hash + ", 0u, xe_debug_product, xe_debug_outputs, xe_debug_inputs);\n";
+                    source += "    XeDebugCount(" + hash + ", 0u, xe_debug_product, xe_debug_outputs, xe_debug_inputs, xe_debug_components);\n";
                 }
                 source += R"(
     XeVertexOutput xe_output;
@@ -1249,6 +1338,8 @@ float4 XeMinMaxFactors(float4 color, uint factors)
                 source += prologue;
                 source += "    float4 xe_color[4] = { float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0), float4(0.0, 0.0, 0.0, 0.0) };\n";
                 source += "    float4 xe_depth_export = float4(xe_input.position.z, 0.0, 0.0, 0.0);\n";
+                if (m_debugShow)
+                    source += "    float4 xe_debug_show = float4(1.0, 0.0, 1.0, 1.0);\n";
                 if (m_options.centroidInterpolators)
                 {
                     for (uint32_t i = 0; i < interpolatorCount; i++)
@@ -1266,9 +1357,13 @@ float4 XeMinMaxFactors(float4 color, uint factors)
     }
 )", temps);
                 if (m_options.debugNan)
-                    source += Format("    [unroll] for (uint xe_n = 0u; xe_n < %uu; xe_n++)\n    {\n        if (any(XeNonFinite(r[xe_n])))\n"
-                                     "            xe_debug_inputs |= %uu;\n    }\n",
+                    source += Format("    uint2 xe_debug_components = uint2(0u, 0u);\n"
+                                     "    [unroll] for (uint xe_n = 0u; xe_n < %uu; xe_n++)\n"
+                                     "        xe_debug_components[xe_n >> 3u] |= XeNonFiniteNibble(r[xe_n]) << ((xe_n & 7u) * 4u);\n"
+                                     "    if (any(xe_debug_components != 0u))\n        xe_debug_inputs |= %uu;\n",
                         interpolatorCount, kDebugNonFiniteInterpolators);
+                if (m_debugShow && DebugShowSetting().mode == 'i')
+                    source += Format("    xe_debug_show = r[%u];\n", std::min(DebugShowSetting().index, temps - 1));
                 source += m_body;
                 // DEBUG_SOLID_PS=1 makes every pixel shader output a color encoding its depth (geometry diagnostics).
                 static const bool solidPixels = [] {
@@ -1278,6 +1373,12 @@ float4 XeMinMaxFactors(float4 color, uint factors)
                 if (solidPixels)
                     source += "    [unroll] for (uint xe_d = 0u; xe_d < 4u; xe_d++)\n        xe_color[xe_d] = float4(frac(xe_input.position.z * 32.0), "
                               "frac(xe_input.position.z * 4.0), xe_input.position.z, 1.0);\n";
+                if (m_debugShow)
+                {
+                    if (DebugShowSetting().mode == 'r')
+                        source += Format("    xe_debug_show = r[%u];\n", std::min(DebugShowSetting().index, temps - 1));
+                    source += "    xe_color[0] = float4(xe_debug_show.xyz, 1.0);\n";
+                }
                 if (m_options.debugNan)
                 {
                     // Non-finite colors become magenta.
@@ -1291,7 +1392,7 @@ float4 XeMinMaxFactors(float4 color, uint factors)
                     }
                     if (m_shader.writesDepth)
                         source += Format("    if (XeNonFinite(xe_depth_export).x)\n        xe_debug_outputs = %uu;\n", kDebugNonFiniteColor);
-                    source += "    XeDebugCount(" + hash + ", 1u, xe_debug_product, xe_debug_outputs, xe_debug_inputs);\n";
+                    source += "    XeDebugCount(" + hash + ", 1u, xe_debug_product, xe_debug_outputs, xe_debug_inputs, xe_debug_components);\n";
                     // DEBUG_NAN=2: non-finite interpolators paint the pixel green.
                     if (m_options.debugNan >= 2)
                         source += Format("    if (xe_debug_inputs & %uu)\n    {\n        [unroll] for (uint xe_m = 0u; xe_m < 4u; xe_m++)\n"

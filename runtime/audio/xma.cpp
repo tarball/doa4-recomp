@@ -405,6 +405,11 @@ namespace
         std::bitset<kContextCount> allocated;
         std::bitset<kContextCount> enabled;
         uint32_t framesSincePacket[kContextCount] = {};
+        // Contexts the game kicks through the registers: where decoding left the input (read offset, current buffer),
+        // to tell when the game has moved it (a new sound, a seek) and the stream must restart.
+        std::bitset<kContextCount> positionKnown;
+        uint32_t readOffset[kContextCount] = {};
+        uint32_t currentBuffer[kContextCount] = {};
 #if HAVE_FFMPEG
         Stream streams[kContextCount];
 #endif
@@ -664,7 +669,8 @@ namespace
         bool wrote = false;
         for (;;)
         {
-            const uint32_t free = write < read ? read - write : blockCount - write + read;
+            // The ring is empty when the offsets meet at first (its output buffer is valid), full once they meet again.
+            const uint32_t free = wrote && write == read ? 0 : write < read ? read - write : blockCount - write + read;
             if (free < frameBlocks || !(context.Input0Valid() || context.Input1Valid()))
                 break;
             for (uint32_t b = 0; b < frameBlocks; b++)
@@ -788,6 +794,7 @@ namespace
             decoder.allocated[i] = true;
             decoder.enabled[i] = false;
             decoder.framesSincePacket[i] = 0;
+            decoder.positionKnown[i] = false;
 #if HAVE_FFMPEG
             decoder.streams[i].Restart(32);
 #endif
@@ -812,6 +819,7 @@ namespace
         const uint32_t index = decoder.Index(context);
         decoder.allocated[index] = false;
         decoder.enabled[index] = false;
+        decoder.positionKnown[index] = false;
 #if HAVE_FFMPEG
         decoder.streams[index].Close();
         decoder.streams[index].Restart(32);
@@ -972,7 +980,7 @@ namespace
         });
     }
 
-    // DUMP_XMA=1: an input buffer as it becomes valid (its data is ready then).
+    // DUMP_XMA=1: an input buffer as it becomes valid (its data is ready then), or as a kick finds it valid.
     void DumpInput(const Context& c, uint32_t physical, uint32_t packets)
     {
         static const bool dumping = [] {
@@ -1082,6 +1090,131 @@ namespace
             c.SetOutputReadOffset(offset);
             return 0u;
         });
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // The decoder's registers. Later XDKs' XAudio (DOAX2's) drives the contexts through them instead of the XMA*
+    // exports, keeping a copy of each context that it copies in before kicking it and back once the decoder is done
+    // with it. The registers are a little-endian page at 0x7FEA0000, register n at byte 4n (as in Xenia's
+    // xma_register_table.inc):
+    //   ContextArrayAddress (0x600): the context array's physical address, which XAudio reads to turn a context's
+    //     address into its index.
+    //   CurrentContextIndex (0x606): the context the decoder is working on, with bit 9 set while it is; XAudio waits
+    //     until that isn't one of a voice's contexts before copying them back.
+    //   Kick (0x650-0x659), Lock (0x690-0x699) and Clear (0x6A0-0x6A9): one bit per context. A kick decodes until the
+    //     context's output ring is full or its input is used up; a clear resets its buffers.
+    // A kick is decoded at once, on the kicking thread, so the decoder is never busy when XAudio looks and
+    // CurrentContextIndex stays 0. XAudio sets the contexts up itself (no XMAInitializeContext or read offset export
+    // tells the decoder), so a kick that finds the input moved from where decoding left it restarts the stream there.
+    constexpr uint32_t kContextArrayRegister = 0x600;
+    constexpr uint32_t kKickRegisters = 0x650, kLockRegisters = 0x690, kClearRegisters = 0x6A0, kRegistersPerGroup = 10;
+
+    std::bitset<kContextCount> g_kickedSinceClear; // for TRACE_XMA
+
+    bool DecodesSilently()
+    {
+#if HAVE_FFMPEG
+        static const bool silent = [] {
+            const char* setting = std::getenv(GAME_PREFIX "_XMA_SILENT");
+            return setting && std::atoi(setting) != 0;
+        }();
+        return silent;
+#else
+        return true;
+#endif
+    }
+
+    void KickContext(Decoder& decoder, uint32_t index)
+    {
+        if (!decoder.allocated[index])
+            return;
+        const uint32_t address = decoder.array + index * kContextSize;
+        const Context c = Load(address);
+        if (Tracing() && !g_kickedSinceClear[index])
+        {
+            LOG_INFO("XMA: context %u kicked: input %08X x%u%s, %08X x%u%s, read offset %u, output %08X x%u%s, %u channels, %u Hz", index,
+                c.Input0Pointer(), c.Input0PacketCount(), c.Input0Valid() ? " (valid)" : "", c.Input1Pointer(), c.Input1PacketCount(),
+                c.Input1Valid() ? " (valid)" : "", c.InputReadOffset(), c.OutputPointer(), c.OutputBlockCount(), c.OutputValid() ? " (valid)" : "",
+                c.IsStereo() ? 2 : 1, c.SampleRate());
+        }
+        g_kickedSinceClear[index] = true;
+        if (c.Input0Valid())
+            DumpInput(c, c.Input0Pointer(), c.Input0PacketCount());
+        if (c.Input1Valid())
+            DumpInput(c, c.Input1Pointer(), c.Input1PacketCount());
+        if (DecodesSilently())
+        {
+            WorkSilent(decoder, index);
+            return;
+        }
+#if HAVE_FFMPEG
+        if (!decoder.positionKnown[index] || c.InputReadOffset() != decoder.readOffset[index] || c.CurrentBuffer() != decoder.currentBuffer[index])
+        {
+            if (Tracing() && decoder.positionKnown[index])
+                LOG_INFO("XMA: context %u restarts at buffer %u, bit %u", index, c.CurrentBuffer(), c.InputReadOffset());
+            decoder.streams[index].Restart(c.InputReadOffset());
+        }
+        Work(decoder, index);
+        const Context after = Load(address);
+        decoder.positionKnown[index] = true;
+        decoder.readOffset[index] = after.InputReadOffset();
+        decoder.currentBuffer[index] = after.CurrentBuffer();
+#endif
+    }
+
+    void ClearContext(Decoder& decoder, uint32_t index)
+    {
+        const uint32_t address = decoder.array + index * kContextSize;
+        Context context = Load(address);
+        context.SetInput0Valid(false);
+        context.SetInput1Valid(false);
+        context.SetOutputValid(false);
+        context.SetOutputReadOffset(0);
+        context.SetOutputWriteOffset(0);
+        Store(address, context);
+        decoder.framesSincePacket[index] = 0;
+#if HAVE_FFMPEG
+        decoder.streams[index].Restart(32);
+#endif
+        decoder.positionKnown[index] = false;
+        g_kickedSinceClear[index] = false;
+        if (Tracing())
+            LOG_INFO("XMA: context %u cleared", index);
+    }
+}
+
+// A store XenonRecomp marks as MMIO into the register page; `value` is the register's (see ppc_overrides.h).
+void XmaRegisterWrite(uint32_t address, uint32_t value)
+{
+    const uint32_t reg = (address - audio::kXmaRegisterPage) / 4;
+    const auto apply = [reg, value](uint32_t first, auto&& action) {
+        if (reg < first || reg >= first + kRegistersPerGroup)
+            return false;
+        Decoder& decoder = GetDecoder();
+        std::lock_guard lock(decoder.lock);
+        for (uint32_t bit = 0; bit < 32; bit++)
+        {
+            const uint32_t index = (reg - first) * 32 + bit;
+            if ((value >> bit) & 1 && decoder.array && index < kContextCount)
+                action(decoder, index);
+        }
+        return true;
+    };
+    if (apply(kKickRegisters, KickContext) || apply(kClearRegisters, ClearContext) ||
+        apply(kLockRegisters, [](Decoder& decoder, uint32_t index) { decoder.enabled[index] = false; }))
+        return;
+    LOG_INFO("XMA: register 0x%03X = 0x%08X", reg, value);
+}
+
+namespace audio
+{
+    void InitializeXmaRegisters()
+    {
+        Decoder& decoder = GetDecoder();
+        std::lock_guard lock(decoder.lock);
+        EnsureStarted(decoder);
+        // In host (little-endian) byte order, as XAudio reads it with lwbrx.
+        *reinterpret_cast<uint32_t*>(guest::ToHost(kXmaRegisterPage + kContextArrayRegister * 4)) = guest::PhysicalAddress(decoder.array);
     }
 }
 

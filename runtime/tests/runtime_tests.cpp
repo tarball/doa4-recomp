@@ -11,17 +11,23 @@
 #include "kernel/objects.h"
 #include "kernel/status.h"
 #include "kernel/threads.h"
+#include "module/crt_exports.h"
 #include "netplay/frame.h"
 #include "netplay/replay.h"
 #include "netplay/session.h"
 #include "page_heap.h"
 #include "settings.h"
 #include "util/image.h"
+#include "vfs/iso_device.h"
+#include "vfs/vfs.h"
 #include "xam/achievements.h"
 #include "xam/spa.h"
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
+#include <cmath>
+#include <csetjmp>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
@@ -127,6 +133,25 @@ static void test_heap_top_of_address_space()
 // ---------------------------------------------------------------------------------------------
 // Exports, called through the generated-code ABI.
 
+// Exports DOA4 doesn't import (DOAX2's), which the generated code doesn't declare.
+PPC_EXTERN_FUNC(__imp__KeInitializeSemaphore);
+PPC_EXTERN_FUNC(__imp__KeReleaseSemaphore);
+PPC_EXTERN_FUNC(__imp__NtCreateSemaphore);
+PPC_EXTERN_FUNC(__imp__NtReleaseSemaphore);
+PPC_EXTERN_FUNC(__imp__KeWaitForMultipleObjects);
+PPC_EXTERN_FUNC(__imp__KeResumeThread);
+PPC_EXTERN_FUNC(__imp__XamCreateEnumeratorHandle);
+PPC_EXTERN_FUNC(__imp__XamGetPrivateEnumStructureFromHandle);
+PPC_EXTERN_FUNC(__imp__XexGetModuleHandle);
+PPC_EXTERN_FUNC(__imp__XexGetProcedureAddress);
+
+// A guest stack for calls with more than eight arguments.
+static uint32_t ArgumentStack()
+{
+    static uint32_t stack = guest::SystemAlloc(0x1000);
+    return stack;
+}
+
 struct Call
 {
     std::unique_ptr<PPCContext> ctx = [] {
@@ -140,8 +165,15 @@ struct Call
     {
         const uint64_t values[] = { uint64_t(args)... };
         PPCRegister* regs[] = { &ctx->r3, &ctx->r4, &ctx->r5, &ctx->r6, &ctx->r7, &ctx->r8, &ctx->r9, &ctx->r10 };
-        for (size_t i = 0; i < sizeof...(Args); i++)
+        for (size_t i = 0; i < sizeof...(Args) && i < 8; i++)
             regs[i]->u64 = values[i];
+        // Later arguments go in the caller's parameter save area: 8-byte slots from r1 + 0x50, the value in the low word.
+        if constexpr (sizeof...(Args) > 8)
+        {
+            ctx->r1.u64 = ArgumentStack() + 0x800;
+            for (size_t i = 8; i < sizeof...(Args); i++)
+                guest::StoreU32(uint32_t(ctx->r1.u32 + 0x54 + (i - 8) * 8), uint32_t(values[i]));
+        }
         function(*ctx, guest::g_base);
         return ctx->r3.u32;
     }
@@ -325,6 +357,32 @@ static void test_strings()
     CHECK(converted && strcmp(converted, "Hi!") == 0 && guest::LoadU32(ansi) >> 16 == 3, "converted '%s'", converted ? converted : "(null)");
     call(__imp__RtlFreeAnsiString, ansi);
     CHECK(guest::LoadU32(ansi + 4) == 0, "freed buffer cleared");
+}
+
+// vswprintf keeps UTF-16 outside ASCII, in the format (DOAX2 formats its money after its own currency sign), in wide
+// %s strings and in %c, and still formats numbers and narrow (%hs) strings.
+static void test_wide_printf()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x400);
+    const auto storeWide = [](uint32_t address, const std::u16string& text) {
+        for (size_t i = 0; i <= text.size(); i++)
+            *guest::Translate<be<uint16_t>>(address + uint32_t(i) * 2) = i < text.size() ? uint16_t(text[i]) : 0;
+        return address;
+    };
+    const uint32_t format = storeWide(memory, u"%d %s|%hs|%c|%5d");
+    const uint32_t wideArgument = storeWide(memory + 0x80, u"Zéro");
+    const uint32_t narrowArgument = StoreAnsi(memory + 0xC0, "abc");
+    const uint32_t arguments = memory + 0x100, out = memory + 0x200;
+    const uint64_t slots[] = { 300000, wideArgument, narrowArgument, 0x3042, 42 };
+    for (size_t i = 0; i < std::size(slots); i++)
+        *guest::Translate<be<uint64_t>>(arguments + uint32_t(i) * 8) = slots[i];
+    const uint32_t length = uint32_t(call(__imp__vswprintf, out, format, arguments));
+    const std::u16string expected = u"" u"300000 Zéro|abc|あ|   42";
+    std::u16string text;
+    for (uint32_t i = 0; i < 64 && *guest::Translate<be<uint16_t>>(out + i * 2) != 0; i++)
+        text.push_back(char16_t(uint16_t(*guest::Translate<be<uint16_t>>(out + i * 2))));
+    CHECK(text == expected && length == expected.size(), "%zu units (returned %u), first %04X", text.size(), length, text.empty() ? 0u : uint32_t(text[0]));
 }
 
 static void test_time()
@@ -535,6 +593,16 @@ static void test_threads()
     CHECK(WaitForThread(call, handle) == status::kSuccess && g_threadRuns == runsBefore + 1, "ran after resume");
     call(__imp__NtClose, handle);
 
+    // The same through its KTHREAD.
+    CHECK(call(__imp__ExCreateThread, handlePtr, 0, idPtr, 0, body, 1, kernel::kCreateSuspended) == status::kSuccess, "create suspended");
+    handle = guest::LoadU32(handlePtr);
+    CHECK(call(__imp__ObReferenceObjectByHandle, handle, 0, countPtr) == status::kSuccess, "KTHREAD of the handle");
+    const uint32_t kthread = guest::LoadU32(countPtr);
+    CHECK(call(__imp__KeResumeThread, kthread) == 1, "KeResumeThread: previous count 1");
+    CHECK(WaitForThread(call, handle) == status::kSuccess && g_threadRuns == runsBefore + 2, "ran after KeResumeThread");
+    call(__imp__ObDereferenceObject, kthread);
+    call(__imp__NtClose, handle);
+
     // ExTerminateThread unwinds out of the thread with its exit code.
     const uint32_t terminator = RegisterGuestFunction(2, ThreadTerminatesEarly);
     call(__imp__ExCreateThread, handlePtr, 0, idPtr, 0, terminator, 0, 0);
@@ -714,14 +782,540 @@ static void test_suspension()
     call(__imp__NtClose, handle);
 }
 
+// Semaphores: each wait takes one, releases can't pass the limit; by handle, and in guest memory (KSEMAPHORE) waited
+// for together with an event.
+static void test_semaphores()
+{
+    Call call;
+    const uint32_t out = Scratch() + 0x860, previous = Scratch() + 0x864;
+    CHECK(call(__imp__NtCreateSemaphore, out, 0, 1, 2) == status::kSuccess, "create (count 1, limit 2)");
+    const uint32_t semaphore = guest::LoadU32(out);
+    CHECK(call(__imp__NtWaitForSingleObjectEx, semaphore, 0, 0, TimeoutPtr(kNoWait)) == status::kSuccess, "takes the one");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, semaphore, 0, 0, TimeoutPtr(kNoWait)) == status::kTimeout, "none left");
+    CHECK(call(__imp__NtReleaseSemaphore, semaphore, 2, previous) == status::kSuccess && guest::LoadU32(previous) == 0, "release 2 (previous 0)");
+    CHECK(call(__imp__NtReleaseSemaphore, semaphore, 1, previous) == 0xC0000047, "past the limit");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, semaphore, 0, 0, TimeoutPtr(kNoWait)) == status::kSuccess &&
+          call(__imp__NtWaitForSingleObjectEx, semaphore, 0, 0, TimeoutPtr(kNoWait)) == status::kSuccess &&
+          call(__imp__NtWaitForSingleObjectEx, semaphore, 0, 0, TimeoutPtr(kNoWait)) == status::kTimeout, "two, then none");
+    CHECK(call(__imp__NtCreateSemaphore, out, 0, 3, 2) == status::kInvalidParameter, "count above the limit");
+    call(__imp__NtClose, semaphore);
+
+    const uint32_t ksemaphore = guest::KernelAlloc(0x14);
+    call(__imp__KeInitializeSemaphore, ksemaphore, 0, 5);
+    CHECK(guest::ToHost(ksemaphore)[0] == 5 && guest::LoadU32(ksemaphore + 4) == 0 && guest::LoadU32(ksemaphore + 0x10) == 5, "type 5, count 0, limit 5");
+    call(__imp__NtCreateEvent, out, 0, 0 /* notification */, 1);
+    const uint32_t event = guest::LoadU32(out);
+    CHECK(call(__imp__ObReferenceObjectByHandle, event, 0, out) == status::kSuccess, "event's KEVENT");
+    const uint32_t objects = Scratch() + 0x870;
+    guest::StoreU32(objects, ksemaphore);
+    guest::StoreU32(objects + 4, guest::LoadU32(out));
+    // KeWaitForMultipleObjects(count, objects, waitType (0 all, 1 any), reason, mode, alertable, timeout, wait blocks).
+    CHECK(call(__imp__KeWaitForMultipleObjects, 2, objects, 1, 0, 0, 0, TimeoutPtr(kNoWait), 0) == status::kSuccess + 1, "any: the event");
+    CHECK(call(__imp__KeWaitForMultipleObjects, 2, objects, 0, 0, 0, 0, TimeoutPtr(kNoWait), 0) == status::kTimeout, "all: needs the semaphore");
+    CHECK(int32_t(call(__imp__KeReleaseSemaphore, ksemaphore, 0, 3, 0)) == 0, "KeReleaseSemaphore returns the previous count");
+    CHECK(call(__imp__KeWaitForMultipleObjects, 2, objects, 0, 0, 0, 0, TimeoutPtr(kNoWait), 0) == status::kSuccess, "all");
+    CHECK(guest::LoadU32(ksemaphore + 4) == 2, "the wait took one of 3");
+    CHECK(int32_t(call(__imp__KeReleaseSemaphore, ksemaphore, 0, 4, 0)) == 2 && guest::LoadU32(ksemaphore + 4) == 2, "past the limit: unchanged");
+    call(__imp__ObDereferenceObject, guest::LoadU32(objects + 4));
+    call(__imp__NtClose, event);
+}
+
+// Hard disk partitions: the partition itself (named without a trailing backslash) is its raw sectors, which read back
+// what was written and zeros elsewhere and answer the disk queries; a FATX superblock written there sets the cluster
+// size its file system reports; and an STFS device over it (XAPI's cache:) is its file system under another name.
+static void test_hard_disk_partition()
+{
+    const std::string folder = "build/test_hdd";
+    std::error_code error;
+    std::filesystem::remove_all(folder, error);
+    vfs::Mount("\\Device\\Harddisk0\\TestCache", vfs::OpenHardDiskPartition("test cache", folder + "/TestCache", folder + "/TestCache.raw", { 0x80000, 0x80000000 }));
+    vfs::Mount("\\Device\\Harddisk0\\TestDisk", vfs::OpenHardDiskPartition("test disk", "", folder + "/TestDisk.raw", { 0, 20ull << 30 }));
+
+    Call call;
+    const uint32_t base = Scratch() + 0xA00;
+    const uint32_t name = base, attributes = base + 0x10, iosb = base + 0x20, handlePtr = base + 0x28, offset = base + 0x30;
+    const uint32_t text = base + 0x40, buffer = base + 0x100, stack = base + 0x200;
+    // ANSI_STRING and OBJECT_ATTRIBUTES (root, name, attributes) for a path.
+    const auto setName = [&](const char* path) {
+        strcpy(reinterpret_cast<char*>(guest::ToHost(text)), path);
+        *guest::Translate<be<uint16_t>>(name) = uint16_t(strlen(path));
+        *guest::Translate<be<uint16_t>>(name + 2) = uint16_t(strlen(path) + 1);
+        guest::StoreU32(name + 4, text);
+        guest::StoreU32(attributes, 0);
+        guest::StoreU32(attributes + 4, name);
+        guest::StoreU32(attributes + 8, 0x40);
+    };
+    // NtOpenFile(&handle, access, attributes, iosb, share, options): the handle, or 0.
+    const auto open = [&](const char* path, uint32_t options, uint32_t* result = nullptr) -> uint32_t {
+        setName(path);
+        const uint32_t status = call(__imp__NtOpenFile, handlePtr, 0xC0100000, attributes, iosb, 3, options);
+        if (result)
+            *result = status;
+        return status == status::kSuccess ? guest::LoadU32(handlePtr) : 0;
+    };
+    const auto at = [&](uint64_t value) {
+        *guest::Translate<be<uint64_t>>(offset) = value;
+        return offset;
+    };
+
+    uint32_t raw = open("\\Device\\Harddisk0\\TestCache", 0x20);
+    CHECK(raw != 0, "raw partition");
+    memset(guest::ToHost(buffer), 0xCC, 16);
+    CHECK(call(__imp__NtReadFile, raw, 0, 0, 0, iosb, buffer, 16, at(2048)) == status::kSuccess && guest::LoadU32(iosb + 4) == 16, "read");
+    CHECK(guest::LoadU32(buffer) == 0 && guest::LoadU32(buffer + 12) == 0, "never written: zeros");
+    memcpy(guest::ToHost(buffer), "Josh", 4);
+    CHECK(call(__imp__NtWriteFile, raw, 0, 0, 0, iosb, buffer, 4, at(2048)) == status::kSuccess, "write");
+    call(__imp__NtClose, raw);
+    raw = open("\\Device\\Harddisk0\\TestCache", 0x20);
+    memset(guest::ToHost(buffer), 0, 16);
+    call(__imp__NtReadFile, raw, 0, 0, 0, iosb, buffer, 8, at(2046));
+    CHECK(memcmp(guest::ToHost(buffer), "\0\0Josh\0\0", 8) == 0, "reads back what was written");
+
+    // NtDeviceIoControlFile(handle, event, apc, apcContext, iosb, code, input, inputLength, output, outputLength): the
+    // last two are on the stack.
+    call.ctx->r1.u64 = stack;
+    guest::StoreU32(stack + 0x54, buffer);
+    guest::StoreU32(stack + 0x5C, 16);
+    CHECK(call(__imp__NtDeviceIoControlFile, raw, 0, 0, 0, iosb, 0x70000, 0, 0) == status::kSuccess, "drive geometry");
+    CHECK(guest::LoadU32(buffer) == 0x80000000 / 512 && guest::LoadU32(buffer + 4) == 512, "%08X sectors of %u bytes", guest::LoadU32(buffer), guest::LoadU32(buffer + 4));
+    CHECK(call(__imp__NtDeviceIoControlFile, raw, 0, 0, 0, iosb, 0x74004, 0, 0) == status::kSuccess, "partition info");
+    CHECK(*guest::Translate<be<uint64_t>>(buffer) == 0x80000 && *guest::Translate<be<uint64_t>>(buffer + 8) == 0x80000000, "offset and length");
+
+    // FileFsSizeInformation of the file system: { total units, free units, sectors per unit, bytes per sector }.
+    uint32_t root = open("\\Device\\Harddisk0\\TestCache\\", 0x21);
+    CHECK(root != 0, "file system root");
+    CHECK(call(__imp__NtQueryVolumeInformationFile, root, iosb, buffer, 24, 3) == status::kSuccess, "size information");
+    CHECK(guest::LoadU32(buffer + 0x10) * guest::LoadU32(buffer + 0x14) == 0x4000, "16 KB clusters before a format");
+    CHECK(*guest::Translate<be<uint64_t>>(buffer) == 0x80000000 / 0x4000, "the partition's size in clusters");
+    call(__imp__NtClose, root);
+    memset(guest::ToHost(buffer), 0, 16);
+    memcpy(guest::ToHost(buffer), "XTAF", 4);
+    guest::StoreU32(buffer + 8, 128); // sectors per cluster
+    call(__imp__NtWriteFile, raw, 0, 0, 0, iosb, buffer, 16, at(0));
+    root = open("\\Device\\Harddisk0\\TestCache\\", 0x21);
+    call(__imp__NtQueryVolumeInformationFile, root, iosb, buffer, 24, 3);
+    CHECK(guest::LoadU32(buffer + 0x10) == 128 && guest::LoadU32(buffer + 0x14) == 512, "formatted with 64 KB clusters");
+    call(__imp__NtClose, root);
+
+    // StfsCreateDevice(parameters, size): device name at 0, the raw partition's handle at 0x18; returns the device at 0x48.
+    const uint32_t parameters = base + 0x300, stfsName = base + 0x360;
+    memset(guest::ToHost(parameters), 0, 0x58);
+    strcpy(reinterpret_cast<char*>(guest::ToHost(stfsName)), "\\Device\\testcache0");
+    *guest::Translate<be<uint16_t>>(parameters) = uint16_t(strlen("\\Device\\testcache0"));
+    guest::StoreU32(parameters + 4, stfsName);
+    guest::StoreU32(parameters + 0x18, raw);
+    CHECK(call(__imp__StfsCreateDevice, parameters, 0x58) == status::kSuccess && guest::LoadU32(parameters + 0x48) != 0, "STFS device");
+    setName("\\Device\\testcache0\\file.bin");
+    guest::StoreU32(stack + 0x54, 0x60); // create options: a synchronous non-directory file
+    CHECK(call(__imp__NtCreateFile, handlePtr, 0xC0100000, attributes, iosb, 0, 0x80, 0, 2 /* create */) == status::kSuccess, "a file on it");
+    call(__imp__NtClose, guest::LoadU32(handlePtr));
+    CHECK(std::filesystem::exists(folder + "/TestCache/file.bin", error), "is the partition's host file");
+
+    // Its times can be set (FileBasicInformation: creation, access, write, change; 0 leaves one), through a read-only
+    // handle too, as DOAX2 sets those of the files it copies; FileNetworkOpenInformation reads them back.
+    const uint32_t file = open("\\Device\\testcache0\\file.bin", 0x60);
+    CHECK(file != 0, "reopened read-only");
+    const uint64_t mastered = 0x01C6F5F92CCA38F0ull; // 2006-10-22
+    memset(guest::ToHost(buffer), 0, 0x38);
+    *guest::Translate<be<uint64_t>>(buffer) = mastered;
+    *guest::Translate<be<uint64_t>>(buffer + 16) = mastered + 10000000; // a second later
+    CHECK(call(__imp__NtSetInformationFile, file, iosb, buffer, 0x28, 4) == status::kSuccess, "set creation and write times");
+    memset(guest::ToHost(buffer), 0, 0x38);
+    CHECK(call(__imp__NtQueryInformationFile, file, iosb, buffer, 0x38, 34) == status::kSuccess, "network open information");
+    CHECK(*guest::Translate<be<uint64_t>>(buffer) == mastered && *guest::Translate<be<uint64_t>>(buffer + 16) == mastered + 10000000,
+        "creation %016llX, write %016llX", (unsigned long long)*guest::Translate<be<uint64_t>>(buffer),
+        (unsigned long long)*guest::Translate<be<uint64_t>>(buffer + 16));
+    CHECK(*guest::Translate<be<uint64_t>>(buffer + 8) > mastered + 10000000, "access time unchanged (0)");
+    call(__imp__NtClose, file);
+    call(__imp__NtClose, raw);
+
+    // Partition0, the whole disk, has no file system.
+    raw = open("\\Device\\Harddisk0\\TestDisk", 0x20);
+    CHECK(raw != 0, "raw disk");
+    call(__imp__NtClose, raw);
+    uint32_t result = 0;
+    CHECK(open("\\Device\\Harddisk0\\TestDisk\\", 0x21, &result) == 0 && result == 0xC000014F, "no file system: 0x%08X", result);
+
+    vfs::RemoveSymbolicLink("\\Device\\testcache0");
+    vfs::Unmount("\\Device\\Harddisk0\\TestCache");
+    vfs::Unmount("\\Device\\Harddisk0\\TestDisk");
+}
+
+// SHA-1, and console signatures that verify exactly what was signed.
+static void test_crypto()
+{
+    Call call;
+    const uint32_t data = Scratch() + 0xB00, digest = Scratch() + 0xB40, valid = Scratch() + 0xB60, signature = Scratch() + 0xC00;
+    memcpy(guest::ToHost(data), "abc", 3);
+    static const uint8_t kAbc[20] = { 0xA9, 0x99, 0x3E, 0x36, 0x47, 0x06, 0x81, 0x6A, 0xBA, 0x3E, 0x25, 0x71, 0x78, 0x50, 0xC2, 0x6C, 0x9C, 0xD0, 0xD8, 0x9D };
+    // XeCryptSha(input1, size1, input2, size2, input3, size3, digest, digestSize).
+    call(__imp__XeCryptSha, data, 3, 0, 0, 0, 0, digest, 20);
+    CHECK(memcmp(guest::ToHost(digest), kAbc, 20) == 0, "SHA-1 of \"abc\"");
+    memset(guest::ToHost(digest), 0, 20);
+    call(__imp__XeCryptSha, data, 1, data + 1, 1, data + 2, 1, digest, 20);
+    CHECK(memcmp(guest::ToHost(digest), kAbc, 20) == 0, "the same in three parts");
+
+    CHECK(call(__imp__XeKeysConsolePrivateKeySign, digest, signature) == 1, "sign");
+    CHECK(call(__imp__XeKeysConsoleSignatureVerification, digest, signature, valid) == 1 && guest::LoadU32(valid) == 1, "verifies");
+    guest::ToHost(signature + 0x1A8)[3] ^= 1;
+    CHECK(call(__imp__XeKeysConsoleSignatureVerification, digest, signature, valid) == 1 && guest::LoadU32(valid) == 0, "a changed signature doesn't");
+}
+
+// An enumerator an XAM app serves, as DOAX2's XMP library makes one for the user's playlists: its private structure (a
+// 24-byte header, then the bytes the title and the app share), referenced until ObDereferenceObject, and nothing to
+// enumerate (success with no items, which ends the radio menu's search).
+static void test_app_enumerator()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x100);
+    const uint32_t handleOut = memory, structureOut = memory + 4, countOut = memory + 8, buffer = memory + 0x10;
+    const uint64_t created = call(__imp__XamCreateEnumeratorHandle, 0xFFFFFFFF, 0xFA, 0x70026, 0x70027, 5544, 1, 0, handleOut);
+    CHECK(created == 0, "create: %llu", (unsigned long long)created);
+    const uint32_t handle = guest::LoadU32(handleOut);
+    CHECK(call(__imp__XamGetPrivateEnumStructureFromHandle, handle, structureOut) == 0, "private structure");
+    const uint32_t structure = guest::LoadU32(structureOut);
+    CHECK(structure && guest::LoadU32(structure) == 0xFA && guest::LoadU32(structure + 4) == 0x70026 && guest::LoadU32(structure + 16) == 1,
+        "header at %08X: app %X, open %X", structure, structure ? guest::LoadU32(structure) : 0, structure ? guest::LoadU32(structure + 4) : 0);
+    CHECK(structure && guest::LoadU32(structure + 24) == 0 && guest::LoadU32(structure + 24 + 5540) == 0, "shared bytes zeroed");
+    CHECK(call(__imp__XamEnumerate, handle, 0, buffer, 820, countOut, 0) == 0 && guest::LoadU32(countOut) == 0, "nothing");
+    call(__imp__ObDereferenceObject, structure);
+    CHECK(call(__imp__NtClose, handle) == status::kSuccess, "close");
+}
+
+// Writes a NUL-terminated ASCII string as big-endian UTF-16 and returns its address.
+static uint32_t WriteWide(uint32_t address, const char* string)
+{
+    for (size_t i = 0;; i++)
+    {
+        *guest::Translate<be<uint16_t>>(address + uint32_t(i) * 2) = uint16_t(string[i]);
+        if (!string[i])
+            return address;
+    }
+}
+
+// The next notification a listener gets within `milliseconds`: { ID, parameter }, or { 0xFFFFFFFF, 0 }.
+static std::pair<uint32_t, uint32_t> NextNotification(uint32_t listener, uint32_t milliseconds)
+{
+    Call call;
+    const uint32_t out = Scratch() + 0x900;
+    for (uint32_t waited = 0;; waited += 5)
+    {
+        if (call(__imp__XNotifyGetNext, listener, 0, out, out + 4) == 1)
+            return { guest::LoadU32(out), guest::LoadU32(out + 4) };
+        if (waited >= milliseconds)
+            return { 0xFFFFFFFF, 0 };
+        Sleep(5);
+    }
+}
+
+// System UIs (ui.cpp) answer at once. Where the game has their XN_SYS_UI notifications (GAME_SYSTEM_UI_NOTIFICATIONS:
+// DOAX2's XBOX LIVE menu waits for them), opened with the call and closed on the listener's first poll after that finds
+// nothing else (at the game's own pace, so two machines in a netplay session go through them alike); DOA4 has none. A new
+// listener of the system area first hears who is signed in. A message box asking a player who isn't signed in (DOA4's
+// player 2, asked to sign in to save) is answered with its last button, declining.
+static void test_system_ui()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x400);
+    const uint32_t overlapped = memory, result = memory + 0x20, eventOut = memory + 0x24, buttons = memory + 0x28, text = memory + 0x100,
+                   buffer = memory + 0x300;
+    using Notification = std::pair<uint32_t, uint32_t>;
+    const Notification none(0xFFFFFFFF, 0);
+
+    const uint32_t listener = call(__imp__XamNotifyCreateListener, 1 /* system */, 0);
+    CHECK(NextNotification(listener, 0) == Notification(0x0A, 1), "XN_SYS_SIGNINCHANGED: user 0 is signed in");
+    CHECK(NextNotification(listener, 0) == none, "nothing else");
+    // A UI's notifications: open on the next poll, closed on the poll after one that finds nothing; or none.
+    const auto openedThenClosed = [&]() {
+        if (!GAME_SYSTEM_UI_NOTIFICATIONS)
+            return NextNotification(listener, 0) == none;
+        return NextNotification(listener, 0) == Notification(0x09, 1) && NextNotification(listener, 0) == none &&
+               NextNotification(listener, 0) == Notification(0x09, 0) && NextNotification(listener, 0) == none;
+    };
+
+    // The sign-in UI: the player backs out.
+    CHECK(call(__imp__XamShowSigninUI, 1, 2) == 0, "sign-in UI");
+    CHECK(openedThenClosed(), "sign-in UI: XN_SYS_UI opened, then closed (%s)", GAME_SYSTEM_UI_NOTIFICATIONS ? "notified" : "none");
+
+    // A message box with an XOVERLAPPED: completed before the call returns, with the focused button.
+    CHECK(call(__imp__NtCreateEvent, eventOut, 0, 0 /* notification */, 0) == status::kSuccess, "event");
+    const uint32_t event = guest::LoadU32(eventOut);
+    memset(guest::ToHost(overlapped), 0, 0x1C);
+    guest::StoreU32(overlapped + 12, event);
+    guest::StoreU32(buttons, WriteWide(text + 0x40, "OK"));
+    guest::StoreU32(buttons + 4, WriteWide(text + 0x60, "Cancel"));
+    guest::StoreU32(result, 0xFFFFFFFF);
+    const uint32_t shown = call(__imp__XamShowMessageBoxUI, 0, WriteWide(text, "Title"), WriteWide(text + 0x20, "Text"), 2, buttons, 1, 0, result,
+        overlapped);
+    CHECK(shown == 997 && guest::LoadU32(overlapped) == 0 && guest::LoadU32(result) == 1, "answered at once: %u, %u, button %u", shown,
+        guest::LoadU32(overlapped), guest::LoadU32(result));
+    CHECK(call(__imp__NtWaitForSingleObjectEx, event, 0, 0, TimeoutPtr(kNoWait)) == status::kSuccess, "its event set");
+    CHECK(openedThenClosed(), "message box: opened, then closed");
+
+    // Player 2 isn't signed in: the last button, declining.
+    guest::StoreU32(result, 0xFFFFFFFF);
+    call(__imp__XamShowMessageBoxUI, 1, WriteWide(text, "Sign In"), WriteWide(text + 0x20, "Player2"), 2, buttons, 0, 3, result, 0);
+    CHECK(guest::LoadU32(result) == 1, "player 2: button %u", guest::LoadU32(result));
+    CHECK(openedThenClosed(), "player 2's message box: opened and closed");
+
+    // The keyboard gives its default text, cut to the buffer.
+    memset(guest::ToHost(overlapped), 0, 0x1C);
+    const uint32_t typed = call(__imp__XamShowKeyboardUI, 0, 0, WriteWide(text, "Default name"), 0, 0, buffer, 8, overlapped);
+    bool same = true;
+    for (uint32_t i = 0; i < 7; i++)
+        same = same && *guest::Translate<be<uint16_t>>(buffer + i * 2) == uint16_t("Default"[i]);
+    CHECK(typed == 997 && guest::LoadU32(overlapped) == 0 && same && *guest::Translate<be<uint16_t>>(buffer + 14) == 0, "keyboard: \"Default\"");
+
+    // Two UIs before a poll: both open, and one close after the queue runs dry.
+    call(__imp__XamShowSigninUI, 1, 2);
+    if (GAME_SYSTEM_UI_NOTIFICATIONS)
+        CHECK(NextNotification(listener, 0) == Notification(0x09, 1), "the keyboard opened");
+    CHECK(openedThenClosed(), "two UIs: closed once");
+
+    call(__imp__NtClose, event);
+    call(__imp__NtClose, listener);
+}
+
+// Profile settings: the dashboard's defaults, no value for the others; the size first (ERROR_INSUFFICIENT_BUFFER).
+static void test_profile_settings()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x400);
+    const uint32_t ids = memory, size = memory + 0x10, buffer = memory + 0x20;
+    const uint32_t settingIds[] = { 0x10040003 /* vibration */, 0x402C0011 /* motto */, 0x10040015 /* difficulty */, 0x63E83FFF /* title's own */ };
+    for (uint32_t i = 0; i < 4; i++)
+        guest::StoreU32(ids + i * 4, settingIds[i]);
+    guest::StoreU32(size, 0);
+    CHECK(call(__imp__XamUserReadProfileSettings, 0, 0, 0, 0, 4, ids, size, 0, 0) == 122 && guest::LoadU32(size) == 8 + 4 * 40 + 4,
+        "size: %u", guest::LoadU32(size));
+    CHECK(call(__imp__XamUserReadProfileSettings, 0, 0, 0, 0, 4, ids, size, buffer, 0) == 0, "read");
+    CHECK(guest::LoadU32(buffer) == 4 && guest::LoadU32(buffer + 4) == buffer + 8, "4 settings after the header");
+    const auto setting = [&](uint32_t i) { return buffer + 8 + i * 40; };
+    CHECK(guest::LoadU32(setting(0)) == 1 && guest::LoadU32(setting(0) + 8) == 0 && guest::LoadU32(setting(0) + 16) == 0x10040003 &&
+        *guest::ToHost(setting(0) + 24) == 1 && guest::LoadU32(setting(0) + 32) == 3, "vibration: on (default)");
+    const uint32_t motto = guest::LoadU32(setting(1) + 36);
+    CHECK(guest::LoadU32(setting(1)) == 1 && *guest::ToHost(setting(1) + 24) == 4 && guest::LoadU32(setting(1) + 32) == 2 &&
+        motto >= buffer + 8 + 160 && motto < buffer + 8 + 164 && *guest::Translate<be<uint16_t>>(motto) == 0, "motto: empty");
+    CHECK(guest::LoadU32(setting(2)) == 1 && guest::LoadU32(setting(2) + 32) == 0, "difficulty: normal");
+    CHECK(guest::LoadU32(setting(3)) == 0 && *guest::ToHost(setting(3) + 24) == 6 && guest::LoadU32(setting(3) + 32) == 0, "the title's own: none");
+    CHECK(call(__imp__XamUserReadProfileSettings, 0, 1, 0, 0, 4, ids, size, buffer, 0) == 1317, "user 1 isn't signed in");
+}
+
+// Timers: due once or every period, set and cancelled.
+static void test_timers()
+{
+    Call call;
+    const uint32_t out = Scratch() + 0x810, due = Scratch() + 0x830, state = Scratch() + 0x838;
+    CHECK(call(__imp__NtCreateTimer, out, 0, 1 /* synchronization */) == status::kSuccess, "create a synchronization timer");
+    const uint32_t periodic = guest::LoadU32(out);
+    *guest::Translate<be<int64_t>>(due) = -200000; // 20 ms from now
+    CHECK(call(__imp__NtSetTimerEx, periodic, due, 0, 1, 0, 0, 20, state) == status::kSuccess && *guest::ToHost(state) == 0, "set: 20 ms, every 20 ms");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, periodic, 0, 0, TimeoutPtr(kNoWait)) == status::kTimeout, "not due yet");
+    const auto start = GetTickCount64();
+    CHECK(call(__imp__NtWaitForSingleObjectEx, periodic, 0, 0, TimeoutPtr(-10000000 /* 1 s */)) == status::kSuccess, "due");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, periodic, 0, 0, TimeoutPtr(-10000000)) == status::kSuccess, "due again");
+    const auto elapsed = GetTickCount64() - start;
+    CHECK(elapsed >= 25 && elapsed < 500, "two periods in %llu ms", (unsigned long long)elapsed);
+    CHECK(call(__imp__NtCancelTimer, periodic, state) == status::kSuccess, "cancel");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, periodic, 0, 0, TimeoutPtr(-1000000 /* 100 ms */)) == status::kTimeout, "not due after that");
+
+    CHECK(call(__imp__NtCreateTimer, out, 0, 0 /* notification */) == status::kSuccess, "create a notification timer");
+    const uint32_t once = guest::LoadU32(out);
+    *guest::Translate<be<int64_t>>(due) = -100000; // 10 ms
+    CHECK(call(__imp__NtSetTimerEx, once, due, 0, 1, 0, 0, 0, 0) == status::kSuccess, "set: 10 ms, once");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, once, 0, 0, TimeoutPtr(-10000000)) == status::kSuccess &&
+        call(__imp__NtWaitForSingleObjectEx, once, 0, 0, TimeoutPtr(kNoWait)) == status::kSuccess, "due, and stays signaled");
+    *guest::Translate<be<int64_t>>(due) = -100000000; // 10 s
+    CHECK(call(__imp__NtSetTimerEx, once, due, 0, 1, 0, 0, 0, state) == status::kSuccess && *guest::ToHost(state) == 1, "set again: was signaled");
+    CHECK(call(__imp__NtWaitForSingleObjectEx, once, 0, 0, TimeoutPtr(kNoWait)) == status::kTimeout, "and isn't now");
+    CHECK(call(__imp__NtClose, periodic) == status::kSuccess && call(__imp__NtClose, once) == status::kSuccess, "close");
+}
+
+// Xbox Live: session objects (whose creation XAM's Live app then refuses), and empty achievement and leaderboard enumerations.
+static void test_live_offline()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x400);
+    const uint32_t handleOut = memory, objectOut = memory + 4, sizeOut = memory + 8, countOut = memory + 12, buffer = memory + 0x10,
+                   spec = memory + 0x100;
+    CHECK(call(__imp__XamSessionCreateHandle, handleOut) == 0, "session handle");
+    const uint32_t session = guest::LoadU32(handleOut);
+    CHECK(call(__imp__XamSessionRefObjByHandle, session, objectOut) == 0 && guest::LoadU32(objectOut) != 0, "its object");
+    call(__imp__ObDereferenceObject, guest::LoadU32(objectOut));
+    CHECK(call(__imp__NtClose, session) == status::kSuccess && call(__imp__XamSessionRefObjByHandle, session, objectOut) == 6, "closed");
+
+    CHECK(call(__imp__XamUserCreateAchievementEnumerator, 0, 0, 0x0009000000000001ull, 0xFFFFFFFF, 0, 50, sizeOut, handleOut) == 0 &&
+        guest::LoadU32(sizeOut) == 50 * (0x24 + 66 + 202 + 202), "achievements: %u bytes for 50", guest::LoadU32(sizeOut));
+    uint32_t handle = guest::LoadU32(handleOut);
+    CHECK(call(__imp__XamEnumerate, handle, 0, buffer, 0x40, countOut, 0) == 18 && guest::LoadU32(countOut) == 0, "none");
+    call(__imp__NtClose, handle);
+
+    memset(guest::ToHost(spec), 0, 136);
+    guest::StoreU32(spec, 1);     // view
+    guest::StoreU32(spec + 4, 2); // columns
+    CHECK(call(__imp__XamUserCreateStatsEnumerator, 0, 1, 1, 10, 1, spec, sizeOut, handleOut) == 0 &&
+        guest::LoadU32(sizeOut) == 8 + 16 + 10 * (48 + 2 * 24), "leaderboard: %u bytes", guest::LoadU32(sizeOut));
+    handle = guest::LoadU32(handleOut);
+    CHECK(call(__imp__XamEnumerate, handle, 0, buffer, 0x40, countOut, 0) == 18 && guest::LoadU32(countOut) == 0, "no rows");
+    call(__imp__NtClose, handle);
+}
+
+// RtlRaiseException: a thread name for the debugger (MSVC's 0x406D1388) goes on. (The others end the game.)
+static void test_raise_exception()
+{
+    Call call;
+    const uint32_t record = guest::SystemAlloc(0x60);
+    memset(guest::ToHost(record), 0, 0x50);
+    guest::StoreU32(record, 0x406D1388);
+    guest::StoreU32(record + 16, 4);
+    call(__imp__RtlRaiseException, record);
+    CHECK(true, "returned");
+}
+
+// The music player (XAM app 0xFA, through XMsg): a title playlist played, its status and current song, next, stop and
+// delete; and the state changes notified to listeners of the XMP area.
+static void test_music_player()
+{
+    Call call;
+    const uint32_t memory = guest::SystemAlloc(0x2000);
+    const uint32_t args = memory, out = memory + 0x40, storage = memory + 0x100, songs = memory + 0x300, text = memory + 0x400;
+    const uint32_t info = memory + 0x800, notification = memory + 0x60;
+    const auto wide = [](uint32_t address, const char* string) {
+        for (size_t i = 0;; i++)
+        {
+            *guest::Translate<be<uint16_t>>(address + uint32_t(i) * 2) = uint16_t(string[i]);
+            if (!string[i])
+                return address;
+        }
+    };
+    const auto message = [&](uint32_t id, std::initializer_list<uint32_t> values) {
+        uint32_t i = 0;
+        for (uint32_t value : values)
+            guest::StoreU32(args + 4 * i++, value);
+        return call(__imp__XMsgInProcessCall, 0xFA, id, args, 4 * i);
+    };
+
+    const uint32_t listener = call(__imp__XamNotifyCreateListener, 0x20 /* XMP */, 0);
+    CHECK(listener != 0, "listener");
+
+    CHECK(message(0x7002E, { 2, 2, out }) == 0 && guest::LoadU32(out) == 4 + 2 * 128, "storage for 2 songs: %u", guest::LoadU32(out));
+    // XMP_SONGDESCRIPTOR: path, title, artist, album, album artist, genre, track, duration, format.
+    const char* titles[] = { "First", "Second" };
+    for (uint32_t i = 0; i < 2; i++)
+    {
+        const uint32_t descriptor = songs + i * 36;
+        memset(guest::ToHost(descriptor), 0, 36);
+        guest::StoreU32(descriptor, wide(text + i * 0x100, i ? "GAME:\\b.mp3" : "GAME:\\a.mp3"));
+        guest::StoreU32(descriptor + 4, wide(text + i * 0x100 + 0x40, titles[i]));
+        guest::StoreU32(descriptor + 24, i + 1);
+        guest::StoreU32(descriptor + 28, 1000 * (i + 1));
+    }
+    const uint32_t handles = out + 4, playlistOut = out + 12;
+    CHECK(message(0x7000D, { 2, storage, 260, songs, 2, 0, 0, handles, playlistOut }) == 0, "create the playlist");
+    const uint32_t playlist = guest::LoadU32(playlistOut), second = guest::LoadU32(handles + 4);
+    CHECK(playlist == storage && guest::LoadU32(handles) != 0 && second != 0 && second != guest::LoadU32(handles), "its handle and the songs'");
+
+    CHECK(message(0x70002, { 2, playlist, second }) == 0, "play from the second song");
+    CHECK(message(0x70009, { 2, out }) == 0 && guest::LoadU32(out) == 1, "playing: %u", guest::LoadU32(out));
+    CHECK(call(__imp__XNotifyGetNext, listener, 0, notification, notification + 4) == 1 && guest::LoadU32(notification) == 0x0A000001 &&
+          guest::LoadU32(notification + 4) == 1, "notified: state changed to playing");
+    CHECK(call(__imp__XNotifyGetNext, listener, 0, notification, notification + 4) == 0, "only once");
+    const auto infoTitle = [&] {
+        std::string title;
+        for (uint32_t i = 0; i < 40 && *guest::Translate<be<uint16_t>>(info + 576 + i * 2) != 0; i++)
+            title.push_back(char(uint16_t(*guest::Translate<be<uint16_t>>(info + 576 + i * 2))));
+        return title;
+    };
+    CHECK(message(0x7000E, { 2, 0, info }) == 0 && infoTitle() == "Second" && guest::LoadU32(info + 980) == 2000, "current song: \"%s\"", infoTitle().c_str());
+    CHECK(message(0x70006, { 2 }) == 0 && message(0x7000E, { 2, 0, info }) == 0 && infoTitle() == "First", "next wraps around: \"%s\"", infoTitle().c_str());
+    CHECK(message(0x70005, { 2 }) == 0 && message(0x70009, { 2, out }) == 0 && guest::LoadU32(out) == 2, "paused");
+    CHECK(message(0x70004, { 2, 0 }) == 0 && message(0x70009, { 2, out }) == 0 && guest::LoadU32(out) == 0, "stopped");
+    CHECK(message(0x7000E, { 2, 0, info }) != 0, "no current song");
+    CHECK(message(0x70013, { 2, playlist }) == 0, "delete");
+    CHECK(message(0x70013, { 2, playlist }) == 0x80070490 && message(0x70002, { 2, playlist, 0 }) == 0x80070490, "gone");
+    uint32_t notifications = 0;
+    while (call(__imp__XNotifyGetNext, listener, 0x0A000001, notification, notification + 4) == 1)
+        notifications++;
+    CHECK(notifications == 3, "state changes after the first: next, pause, stop (%u)", notifications);
+    call(__imp__NtClose, listener);
+    guest::SystemFree(memory);
+}
+
+// XMA contexts through the decoder's registers, as DOAX2's XAudio drives them: the context array's physical address
+// in ContextArrayAddress gives a context's index, a kick fills its output ring (with silence here) and uses up its
+// input, and a clear resets its buffers.
+static void test_xma_registers()
+{
+    Call call;
+    // Decoded as silence (the input here is zeros, which FFmpeg can't decode); set before the first kick reads it.
+    _putenv_s(GAME_PREFIX "_XMA_SILENT", "1");
+    guest::ReserveFixed(audio::kXmaRegisterPage, audio::kXmaRegisterPageSize, guest::kPageReadWrite);
+    audio::InitializeXmaRegisters();
+    const uint32_t arrayPhysical = *reinterpret_cast<const uint32_t*>(guest::ToHost(audio::kXmaRegisterPage + 0x1800)); // little endian
+    const uint32_t out = Scratch() + 0x880;
+    CHECK(call(__imp__XMACreateContext, out) == status::kSuccess, "create");
+    const uint32_t context = guest::LoadU32(out);
+    const uint32_t index = (guest::PhysicalAddress(context) - arrayPhysical) >> 6;
+    CHECK(index < 320 && guest::PhysicalAddress(context) == arrayPhysical + index * 64, "index %u from the register", index);
+
+    // Mono, 48 kHz: input buffer 0 of 2 packets, valid; an output ring of 8 blocks (2 frames of 512 samples), valid.
+    const uint32_t input = guest::AllocPhysical(0x1000, 0x1000, guest::kPageReadWrite, 0, 0x1FFFFFFF, 0x1000);
+    const uint32_t output = guest::AllocPhysical(0x1000, 0x1000, guest::kPageReadWrite, 0, 0x1FFFFFFF, 0x1000);
+    memset(guest::ToHost(output), 0xCC, 0x800);
+    const auto word = [context](uint32_t i) { return guest::LoadU32(context + i * 4); };
+    guest::StoreU32(context + 0, 2 | 1u << 20 | 8u << 22); // input 0: 2 packets, valid; 8 output blocks
+    guest::StoreU32(context + 4, 3u << 27 | 1u << 31);     // 48 kHz, mono, output valid
+    guest::StoreU32(context + 8, 32);                       // read offset: after the first packet's header
+    guest::StoreU32(context + 20, guest::PhysicalAddress(input));
+    guest::StoreU32(context + 28, guest::PhysicalAddress(output));
+    const uint32_t kick = audio::kXmaRegisterPage + 0x1940 + index / 32 * 4, clear = audio::kXmaRegisterPage + 0x1A80 + index / 32 * 4;
+    XmaRegisterWrite(kick, 1u << (index % 32));
+    CHECK(guest::ToHost(output)[0] == 0 && guest::ToHost(output)[0x7FF] == 0, "the ring is full of silence");
+    CHECK((word(0) >> 27) == 0 && !(word(1) >> 31), "write offset wrapped to the read offset: full, output invalid (%08X %08X)", word(0), word(1));
+    CHECK(word(2) == 32, "two frames haven't used a packet up yet: read offset %u", word(2));
+
+    // The game reads both frames (its read offset stays at the write offset) and makes the output valid again: two
+    // frames more, and the 4th uses the first packet up.
+    guest::StoreU32(context + 4, word(1) | 1u << 31);
+    memset(guest::ToHost(output), 0xCC, 0x800);
+    XmaRegisterWrite(kick, 1u << (index % 32));
+    CHECK(guest::ToHost(output)[0] == 0 && guest::ToHost(output)[0x7FF] == 0 && (word(0) >> 27) == 0 && !(word(1) >> 31), "two frames more (%08X)", word(0));
+    CHECK(word(2) == 16384 + 32, "the 4th frame moved on to packet 2: read offset %u", word(2));
+
+    XmaRegisterWrite(clear, 1u << (index % 32));
+    CHECK(!(word(0) & (3u << 20)) && (word(0) >> 27) == 0 && !(word(1) >> 31) && (word(9) & 0x1F) == 0, "cleared: no valid buffers, offsets 0");
+    call(__imp__XMAReleaseContext, context);
+    guest::FreePhysical(input);
+    guest::FreePhysical(output);
+}
+
+// XAM and the kernel by name, and their exports by ordinal: the title's import thunks.
+static void test_system_modules()
+{
+    Call call;
+    const uint32_t text = Scratch() + 0xB80, handle = Scratch() + 0xBA0, procedure = Scratch() + 0xBA4;
+    strcpy(reinterpret_cast<char*>(guest::ToHost(text)), "xam.xex");
+    CHECK(call(__imp__XexGetModuleHandle, text, handle) == status::kSuccess && guest::LoadU32(handle) != 0, "xam.xex");
+    const uint32_t xam = guest::LoadU32(handle);
+    const uint32_t thunk = imports::FunctionThunk("Xam", 1); // NetDll_WSAStartup
+    CHECK(thunk != 0, "the game imports XAM's ordinal 1");
+    CHECK(call(__imp__XexGetProcedureAddress, xam, 1, procedure) == status::kSuccess && guest::LoadU32(procedure) == thunk, "its thunk");
+    CHECK(call(__imp__XexGetProcedureAddress, xam, 0x50, procedure) == 0xC000007A && guest::LoadU32(procedure) == 0, "an ordinal it doesn't import");
+    strcpy(reinterpret_cast<char*>(guest::ToHost(text)), "XBOXKRNL.EXE");
+    CHECK(call(__imp__XexGetModuleHandle, text, handle) == status::kSuccess && guest::LoadU32(handle) != 0 && guest::LoadU32(handle) != xam, "xboxkrnl.exe");
+    strcpy(reinterpret_cast<char*>(guest::ToHost(text)), "xbdm.xex");
+    CHECK(call(__imp__XexGetModuleHandle, text, handle) == 0xC0000135, "no such module");
+}
+
 // ---------------------------------------------------------------------------------------------
 // Shaders
 
 // The shader binaries precompilation finds in the executable: with and without constant tables, all parsed and
 // translated, with nothing the translation can't express but the format 0 fetches of D3D's vertex shader templates
-// (bound copies get their formats). Pixel shaders' centroid variants declare their centroid interpolators so, and the
-// smallest compiles, as do the smallest vertex and pixel shaders with products translated with Xenos products and
-// DEBUG_NAN's counts. Uses the game's executable, when private/default.pe is there.
+// (bound copies get their formats), and vertex fetches addressing the vertex their full fetch indexed. Pixel shaders'
+// centroid variants (their last two interpolators) declare those interpolators so and no others, and the smallest
+// compiles, as do the smallest vertex and pixel shaders with products translated with Xenos products and DEBUG_NAN's
+// counts. Uses the game's executable, when private/default.pe is there.
 static void test_shader_binaries()
 {
     std::ifstream file("private/default.pe", std::ios::binary);
@@ -732,6 +1326,7 @@ static void test_shader_binaries()
     }
     const std::vector<uint8_t> image((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
     uint32_t vertex = 0, pixel = 0, translated = 0, centroids = 0;
+    bool particleShader = false;
     std::string smallestCentroid, smallestProducts[2];
     for (const gpu::shader::ShaderBinary& binary : gpu::shader::FindShaderBinaries(image.data(), image.size()))
     {
@@ -745,15 +1340,40 @@ static void test_shader_binaries()
         translated += !result.source.empty();
         for (const std::string& what : result.unsupported)
             CHECK(isVertex && what == "unsupported vertex format 0", "%s at 0x%zX: %s", isVertex ? "vs" : "ps", binary.offset, what.c_str());
-        if (!isVertex && parsed.tempCount >= 8)
+        // Vertex fetches address the vertex the last full fetch indexed: mini fetches don't re-read the index register,
+        // which a fetch between them may have written. DOA4's particle shader BCE21477 (behind the menus and in attract
+        // mode) writes 1.0 into its index register r0.x with its first mini fetch, so its second read every vertex's
+        // texture coordinates from vertex 1. (DOAX2's ground shader 1427337B fetches its lightmap coordinates after
+        // writing its index register: Tranquil Beach's sand came out white.)
+        const auto count = [&](const char* text) {
+            size_t n = 0;
+            for (size_t at = result.source.find(text); at != std::string::npos; at = result.source.find(text, at + 1))
+                n++;
+            return n;
+        };
+        const size_t fetches = count("uint xe_address = ");
+        CHECK(count("uint xe_address = (xe_vf.x & 0xFFFFFFFCu) + uint(xe_vfetch_index * ") == fetches, "%s at 0x%zX: a vertex fetch not using the full fetch's index",
+            isVertex ? "vs" : "ps", binary.offset);
+        if (parsed.hash == 0xBCE214771AF666CFull)
         {
+            particleShader = true;
+            CHECK(fetches == 3 && count("xe_vfetch_index = int(") == 1, "vs BCE21477: %zu fetches, %zu index reads (expected 3 and 1)", fetches,
+                count("xe_vfetch_index = int("));
+        }
+        if (!isVertex && parsed.tempCount >= 3)
+        {
+            const uint32_t last = std::min(parsed.tempCount, 16u) - 1; // the last interpolator it loads
             gpu::shader::TranslationOptions options;
-            options.centroidInterpolators = 0xC0;
+            options.centroidInterpolators = 3u << (last - 1);
             const std::string source = gpu::shader::TranslateToHlsl(parsed, options).source;
-            const bool declared = source.find("centroid float4 interpolator6 : TEXCOORD6;") != std::string::npos &&
-                source.find("centroid float4 interpolator7 : TEXCOORD7;") != std::string::npos &&
-                source.find("    float4 interpolator5 : TEXCOORD5;") != std::string::npos;
-            CHECK(declared, "ps at 0x%zX: centroid interpolators 6 and 7 not declared so", binary.offset);
+            const auto declaration = [](bool centroid, uint32_t i) {
+                char text[64];
+                snprintf(text, sizeof(text), "%sfloat4 interpolator%u : TEXCOORD%u;", centroid ? "centroid " : "    ", i, i);
+                return std::string(text);
+            };
+            const bool declared = source.find(declaration(true, last - 1)) != std::string::npos &&
+                source.find(declaration(true, last)) != std::string::npos && source.find(declaration(false, last - 2)) != std::string::npos;
+            CHECK(declared, "ps at 0x%zX: centroid interpolators %u and %u not declared so", binary.offset, last - 1, last);
             centroids += declared;
             if (smallestCentroid.empty() || source.size() < smallestCentroid.size())
                 smallestCentroid = source;
@@ -769,7 +1389,8 @@ static void test_shader_binaries()
     }
     // DOA4's: 341 vertex and 185 pixel shaders, 241 of them without a constant table.
     CHECK(vertex == 341 && pixel == 185 && translated == vertex + pixel, "%u vertex, %u pixel, %u translated", vertex, pixel, translated);
-    CHECK(centroids > 0, "no pixel shader with 8 interpolators");
+    CHECK(centroids > 0, "no pixel shader with 3 interpolators or more");
+    CHECK(particleShader, "vertex shader BCE21477 (the menus' particles) not found");
     CHECK(!smallestProducts[0].empty() && !smallestProducts[1].empty(), "no vertex or pixel shader with products");
     auto compile = [](const std::string& source, const char* target, const char* what) {
         ID3DBlob* bytecode = nullptr;
@@ -1345,6 +1966,108 @@ static void test_store_miss_preserves_registers()
     }
 }
 
+// The C runtime's functions the executable exports to the game's code module (module/crt_exports.h): each export is a
+// jump to the C runtime's function. lld-link had bound the export sqrt to the C++ library's sqrt(long double), which
+// looped without end for a negative input, and the CPU fights froze when their particles took the square root of
+// -0.000184 (ANALYSIS.md, Phase 6, The CPU fights' hang). The executable beside the tests must export each from its
+// jump, and the jumps must give what the C runtime's functions give, bit for bit, for every kind of input.
+static void test_module_crt_exports()
+{
+    static const char* const kNames[] = { "_setjmp", "longjmp", "memcpy", "memset", "sqrt", "sqrtf", "fma", "exp2f", "log2f" };
+    wchar_t self[MAX_PATH];
+    const DWORD length = GetModuleFileNameW(nullptr, self, MAX_PATH);
+    const std::filesystem::path executable = std::filesystem::path(std::wstring(self, length)).parent_path() / (GAME_EXECUTABLE ".exe");
+    if (HMODULE image = LoadLibraryExW(executable.c_str(), nullptr, LOAD_LIBRARY_AS_IMAGE_RESOURCE))
+    {
+        // Mapped as an image (sections at their addresses), not loaded: the handle's low bits say so.
+        const auto* base = reinterpret_cast<const uint8_t*>(uintptr_t(image) & ~uintptr_t(3));
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(base + reinterpret_cast<const IMAGE_DOS_HEADER*>(base)->e_lfanew);
+        const IMAGE_DATA_DIRECTORY& directory = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+        CHECK(directory.VirtualAddress != 0, "%ls exports nothing", executable.c_str());
+        if (directory.VirtualAddress)
+        {
+            const auto* exports = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(base + directory.VirtualAddress);
+            const auto* names = reinterpret_cast<const DWORD*>(base + exports->AddressOfNames);
+            const auto* ordinals = reinterpret_cast<const WORD*>(base + exports->AddressOfNameOrdinals);
+            const auto* functions = reinterpret_cast<const DWORD*>(base + exports->AddressOfFunctions);
+            for (const char* name : kNames)
+            {
+                DWORD rva = 0;
+                for (DWORD i = 0; i < exports->NumberOfNames && !rva; i++)
+                    if (strcmp(reinterpret_cast<const char*>(base + names[i]), name) == 0)
+                        rva = functions[ordinals[i]];
+                CHECK(rva != 0, "%s not exported", name);
+                if (!rva)
+                    continue;
+                // jmp rel32 to another function (the export of sqrt was xorps, ucomisd, ja, then a jump to its own start).
+                const uint8_t* code = base + rva;
+                int32_t displacement;
+                memcpy(&displacement, code + 1, sizeof(displacement));
+                CHECK(code[0] == 0xE9 && displacement != -5, "the export %s isn't a jump to the C runtime's (%02X %02X %02X %02X)", name,
+                    code[0], code[1], code[2], code[3]);
+            }
+        }
+        FreeLibrary(image);
+    }
+    else
+        printf("  (no %ls: its exports aren't checked)\n", executable.c_str());
+
+    // The jumps against the C runtime's functions themselves, called through pointers (this executable exports nothing,
+    // so they're the C runtime's), on finite, zero, negative, denormal, infinite and NaN inputs.
+    double (*volatile crtSqrt)(double) = &::sqrt;
+    float (*volatile crtSqrtf)(float) = &::sqrtf;
+    double (*volatile crtFma)(double, double, double) = &::fma;
+    float (*volatile crtExp2f)(float) = &::exp2f;
+    float (*volatile crtLog2f)(float) = &::log2f;
+    const uint64_t doubles[] = { 0x4010000000000000, 0x4000000000000000, 0, 0x8000000000000000, 0xBFF0000000000000,
+        0xBF281F9A20000000 /* the fight's */, 0xFFF0000000000000, 0x7FF0000000000000, 0x7FF8000000000000, 0xFFF8000000000000,
+        0x7FF0000000000001, 0x0000000000000001, 0x800FFFFFFFFFFFFF, 0x7FEFFFFFFFFFFFFF, 0x3FB999999999999A };
+    int mismatches = 0;
+    for (uint64_t a : doubles)
+    {
+        const double x = std::bit_cast<double>(a);
+        CHECK(std::bit_cast<uint64_t>(ModuleCrt_sqrt(x)) == std::bit_cast<uint64_t>(crtSqrt(x)), "sqrt of %016llX: %016llX, the C runtime's %016llX",
+            (unsigned long long)a, (unsigned long long)std::bit_cast<uint64_t>(ModuleCrt_sqrt(x)), (unsigned long long)std::bit_cast<uint64_t>(crtSqrt(x)));
+        const float f = float(x);
+        CHECK(std::bit_cast<uint32_t>(ModuleCrt_sqrtf(f)) == std::bit_cast<uint32_t>(crtSqrtf(f)), "sqrtf of %08X", std::bit_cast<uint32_t>(f));
+        for (uint64_t b : doubles)
+            for (uint64_t c : doubles)
+            {
+                const double y = std::bit_cast<double>(b), z = std::bit_cast<double>(c);
+                mismatches += std::bit_cast<uint64_t>(ModuleCrt_fma(x, y, z)) != std::bit_cast<uint64_t>(crtFma(x, y, z));
+            }
+    }
+    CHECK(mismatches == 0, "%d of fma's 3,375 results differ from the C runtime's", mismatches);
+    CHECK(std::isnan(ModuleCrt_sqrt(std::bit_cast<double>(0xBF281F9A20000000ull))), "the fight's square root isn't NaN");
+    mismatches = 0;
+    for (uint32_t i = 0; i < 4096; i++)
+    {
+        const float f = std::bit_cast<float>(i * 0x00100801u); // every exponent, both signs, NaNs and infinities among them
+        mismatches += std::bit_cast<uint32_t>(ModuleCrt_exp2f(f)) != std::bit_cast<uint32_t>(crtExp2f(f));
+        mismatches += std::bit_cast<uint32_t>(ModuleCrt_log2f(f)) != std::bit_cast<uint32_t>(crtLog2f(f));
+    }
+    CHECK(mismatches == 0, "%d of exp2f's and log2f's 8,192 results differ from the C runtime's", mismatches);
+
+    uint8_t source[67], destination[67];
+    for (size_t i = 0; i < sizeof(source); i++)
+        source[i] = uint8_t(i * 37 + 1);
+    CHECK(ModuleCrt_memcpy(destination, source, sizeof(source)) == destination && memcmp(destination, source, sizeof(source)) == 0);
+    CHECK(ModuleCrt_memset(destination + 3, 0xA5, 60) == destination + 3);
+    CHECK(destination[2] == source[2] && destination[3] == 0xA5 && destination[62] == 0xA5 && destination[63] == source[63]);
+
+    // setjmp and longjmp through the jumps, as clang calls _setjmp (with the frame longjmp unwinds to): the context saved
+    // is the caller's, since a jump leaves its return address and stack as they were.
+    jmp_buf buffer;
+    volatile int jumps = 0;
+    const int value = ModuleCrt__setjmp(buffer, __builtin_frame_address(0));
+    if (value == 0)
+    {
+        jumps = jumps + 1;
+        ModuleCrt_longjmp(buffer, 7);
+    }
+    CHECK(value == 7 && jumps == 1, "setjmp returned %d after %d jumps", value, int(jumps));
+}
+
 #define RUN(test) (printf("- %s\n", #test), test())
 
 int main()
@@ -1369,6 +2092,7 @@ int main()
     RUN(test_physical_memory);
     RUN(test_xam_alloc);
     RUN(test_strings);
+    RUN(test_wide_printf);
     RUN(test_time);
     RUN(test_memory_ulong);
     RUN(test_module);
@@ -1378,10 +2102,23 @@ int main()
     RUN(test_critical_section_contention);
     RUN(test_pulse_and_spinlock);
     RUN(test_suspension);
+    RUN(test_semaphores);
+    RUN(test_hard_disk_partition);
+    RUN(test_crypto);
+    RUN(test_app_enumerator);
+    RUN(test_system_ui);
+    RUN(test_profile_settings);
+    RUN(test_timers);
+    RUN(test_live_offline);
+    RUN(test_raise_exception);
+    RUN(test_music_player);
+    RUN(test_xma_registers);
+    RUN(test_system_modules);
     RUN(test_shader_binaries);
     RUN(test_xma_decoding);
     RUN(test_journal_divergence);
     RUN(test_store_miss_preserves_registers);
+    RUN(test_module_crt_exports);
     RUN(test_netplay_delays);
 
     printf("%d checks, %d failures\n", g_checks, g_failures);
