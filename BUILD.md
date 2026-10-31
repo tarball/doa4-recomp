@@ -16,7 +16,7 @@ They take about 10 GB, and the build a few GB more.
 1. Clone this repository and the XenonRecomp fork side by side:
 
    ```
-   git clone https://github.com/tarball/doa4-recomp-releases.git doa4-recomp
+   git clone https://github.com/tarball/doa4-recomp.git doa4-recomp
    git clone --recursive --branch doa4 https://github.com/tarball/XenonRecomp.git XenonRecomp
    ```
 

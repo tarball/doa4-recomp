@@ -15,7 +15,7 @@ disc image to play.**
 
 ## How to install
 
-1. Download the latest release's zip from [Releases](https://github.com/tarball/doa4-recomp-releases/releases).
+1. Download the latest release's zip from [Releases](https://github.com/tarball/doa4-recomp/releases).
 2. Extract it to a folder of its own that you can write to, such as one in Documents (not Program Files).
 3. Run `DOA4 Launcher.exe`. If Windows says it doesn't recognize the app, choose More info, then Run anyway.
 4. Select your Dead or Alive 4 (Rev 1) (USA, Europe) disc image, choose Play or Netplay, then press Launch.
@@ -36,8 +36,7 @@ To update, extract a new release over the old one. Your saves and settings are k
 
 Netplay plays Versus with another PC, over the internet or a local network. One player hosts on a UDP port (to play
 over the internet, forward that port to the host's PC on its router); the other joins with the host's address and
-port. Both choose the same for fights: Rollback, the default, which plays better over the internet, or Lockstep. Only
-play with people you trust, on a network you trust: netplay hasn't had a security review yet.
+port. Both choose the same for fights: Rollback, the default, which plays better over the internet, or Lockstep.
 
 ## Building
 

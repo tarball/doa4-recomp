@@ -25,7 +25,7 @@ $executable = 'doa4'
 $launcher = "$prefix Launcher.exe"
 $folderName = 'doa4-recomp'
 # The release repository, a commit and a tag a release, and the XenonRecomp fork.
-$sourceRepository = 'https://github.com/tarball/doa4-recomp-releases'
+$sourceRepository = 'https://github.com/tarball/doa4-recomp'
 $xenonRepository = 'https://github.com/tarball/XenonRecomp'
 $xenonUpstream = 'https://github.com/hedge-dev/XenonRecomp'
 
@@ -99,8 +99,7 @@ To play
 
 Netplay plays Versus with another PC. One player hosts on a UDP port (to play over the internet, that port must be
 forwarded to the host's PC on its router); the other joins with the host's address and port. Both choose the same
-for fights: rollback, the default, which plays better over the internet, or lockstep. Only play with people you
-trust, on a network you trust: netplay hasn't had a security review.
+for fights: rollback, the default, which plays better over the internet, or lockstep.
 
 Requirements: 64-bit Windows 10 or 11, a processor with AVX, and a graphics card with Direct3D 12.
 
